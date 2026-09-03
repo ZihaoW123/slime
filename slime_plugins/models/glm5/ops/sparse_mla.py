@@ -1,7 +1,33 @@
 import torch
 
-from .tilelang_sparse_mla_bwd import sparse_mla_bwd
-from .tilelang_sparse_mla_fwd import sparse_mla_fwd_interface
+try:
+    from .tilelang_sparse_mla_bwd import sparse_mla_bwd
+    from .tilelang_sparse_mla_fwd import sparse_mla_fwd_interface
+except ModuleNotFoundError as exc:
+    if exc.name != "tilelang":
+        raise
+    sparse_mla_bwd = None
+    sparse_mla_fwd_interface = None
+
+
+def _pytorch_sparse_mla(q, kv, indices, scaling, d_v=512):
+    """Differentiable sparse MLA reference path for accelerators without TileLang."""
+    if kv.ndim != 3 or kv.shape[1] != 1:
+        raise ValueError(f"Expected kv shape [tokens, 1, dim], got {tuple(kv.shape)}")
+    if indices.ndim == 3:
+        if indices.shape[1] != 1:
+            raise ValueError(f"Expected one KV group in indices, got {tuple(indices.shape)}")
+        indices = indices.squeeze(1)
+
+    valid = indices >= 0
+    safe_indices = indices.clamp(min=0).long()
+    selected = kv.squeeze(1)[safe_indices]
+    logits = torch.einsum("qhd,qkd->qhk", q.float(), selected.float()) * scaling
+    logits = logits.masked_fill(~valid.unsqueeze(1), float("-inf"))
+    probs = torch.softmax(logits, dim=-1).to(q.dtype)
+    output = torch.einsum("qhk,qkv->qhv", probs, selected[..., :d_v])
+    lse = torch.logsumexp(logits, dim=-1)
+    return output, lse
 
 
 class SparseMLA(torch.autograd.Function):
@@ -19,10 +45,14 @@ class SparseMLA(torch.autograd.Function):
         indices = indices.contiguous()
         q, kv = q.contiguous(), kv.contiguous()
         ctx.scaling = scaling
-        tl_out, tl_lse = sparse_mla_fwd_interface(q, kv, indices, sm_scale=scaling)
+        if sparse_mla_fwd_interface is None:
+            tl_out, tl_lse = _pytorch_sparse_mla(q, kv, indices, scaling)
+        else:
+            tl_out, tl_lse = sparse_mla_fwd_interface(q, kv, indices, sm_scale=scaling)
 
         # Save tensors for backward pass
         ctx.save_for_backward(q, kv, indices, tl_out, tl_lse)
+        ctx.use_pytorch_fallback = sparse_mla_fwd_interface is None
 
         return tl_out, tl_lse
 
@@ -38,7 +68,20 @@ class SparseMLA(torch.autograd.Function):
         q, kv, indices, tl_out, tl_lse = ctx.saved_tensors
         scaling = ctx.scaling
 
-        tl_dq, tl_dkv = sparse_mla_bwd(q, kv, tl_out, grad_output.contiguous(), indices, tl_lse, sm_scale=scaling)
+        if ctx.use_pytorch_fallback:
+            with torch.enable_grad():
+                q_replay = q.detach().requires_grad_(True)
+                kv_replay = kv.detach().requires_grad_(True)
+                out, _ = _pytorch_sparse_mla(q_replay, kv_replay, indices, scaling)
+                tl_dq, tl_dkv = torch.autograd.grad(
+                    out,
+                    (q_replay, kv_replay),
+                    grad_output,
+                )
+        else:
+            tl_dq, tl_dkv = sparse_mla_bwd(
+                q, kv, tl_out, grad_output.contiguous(), indices, tl_lse, sm_scale=scaling
+            )
 
         # Return gradients for each input (None for indices as it's not differentiable)
         return tl_dq, tl_dkv, None, None

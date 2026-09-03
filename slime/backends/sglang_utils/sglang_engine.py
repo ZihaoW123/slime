@@ -18,6 +18,12 @@ from slime.utils.http_utils import get_host_info
 logger = logging.getLogger(__name__)
 
 
+def _enable_memory_saver(args) -> bool:
+    if accelerator.device_type() == "npu" and os.environ.get("SLIME_NPU_ENABLE_SGLANG_MEMORY_SAVER", "0") != "1":
+        return False
+    return args.offload_rollout
+
+
 def get_base_gpu_id(args, rank):
     num_gpus = min(args.num_gpus_per_node, args.rollout_num_gpus_per_engine)
     if args.colocate:
@@ -26,6 +32,13 @@ def get_base_gpu_id(args, rank):
         num_actor_gpus = 0 if args.debug_rollout_only else args.actor_num_gpus_per_node * args.actor_num_nodes
         start_index = (num_actor_gpus + rank * num_gpus) % args.num_gpus_per_node
     return start_index
+
+
+def _build_server_args(server_args_dict: dict) -> ServerArgs:
+    """Construct immutable SGLang arguments after normalizing the bind host."""
+    launch_args = dict(server_args_dict)
+    launch_args["host"] = launch_args["host"].strip("[]")
+    return ServerArgs(**launch_args)
 
 
 def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
@@ -48,7 +61,6 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     from sglang.srt.entrypoints.http_server import launch_server
 
     multiprocessing.set_start_method("spawn", force=True)
-    server_args.host = server_args.host.strip("[]")
     p = multiprocessing.Process(target=launch_server, args=(server_args,))
     p.start()
 
@@ -73,7 +85,10 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
     with requests.Session() as session:
         while True:
             try:
-                response = session.get(f"{base_url}/health_generate", headers=headers)
+                # /health respects SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.
+                # Calling /health_generate unconditionally can deadlock the
+                # first NPU/DeepEP request before the router reads metadata.
+                response = session.get(f"{base_url}/health", headers=headers)
                 if response.status_code == 200:
                     break
             except requests.RequestException:
@@ -171,7 +186,7 @@ class SGLangEngine(RayActor):
 
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
-        self.process = launch_server_process(ServerArgs(**server_args_dict))
+        self.process = launch_server_process(_build_server_args(server_args_dict))
         self._register_to_router(server_args_dict)
 
     def _register_to_router(self, server_args_dict):
@@ -529,7 +544,7 @@ def _compute_server_args(
         "trust_remote_code": True,
         "random_seed": args.seed + rank * args.num_gpus_per_node,
         # memory
-        "enable_memory_saver": args.offload_rollout,
+        "enable_memory_saver": _enable_memory_saver(args),
         # distributed
         "host": host,
         "port": port,

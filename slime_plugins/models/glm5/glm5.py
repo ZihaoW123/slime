@@ -28,6 +28,8 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig
 from transformers import AutoConfig
 
 from .ops.indexer import generate_varlen_mask_params, lighting_indexer
+from .ops.normalization import layer_norm_fp32
+from .ops.rope import apply_rotary_pos_emb_thd
 from .ops.sparse_mla import SGLangSparseMLA, SparseMLA
 
 # Names of the indexer submodules. On a DSA model with *cross-layer index
@@ -871,10 +873,6 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
                     return _SGLangRoPE.apply(q, cache, positions)
                 return _apply_sglang_rope_forward(q, cache, positions)
 
-            # worse precision than apex.
-            # from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb_thd
-            from apex.transformer.functional import fused_apply_rotary_pos_emb_thd
-
             # mla use rope interleave
             x1 = q[..., 0::2]
             x2 = q[..., 1::2]
@@ -882,13 +880,13 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
             # TODO remove copy here
             # fuse rope not support this way rope (diff with cp)
             if gathered:
-                return fused_apply_rotary_pos_emb_thd(t, cu_seqlens, rotary_pos_emb.squeeze(0))
+                return apply_rotary_pos_emb_thd(t, cu_seqlens, rotary_pos_emb.squeeze(0))
             else:
                 seq_len = q.shape[0]
                 cp_size = parallel_state.get_context_parallel_world_size()
                 cp_rank = parallel_state.get_context_parallel_rank()
                 t = t.repeat(cp_size, 1, 1)
-                out = fused_apply_rotary_pos_emb_thd(t, cu_seqlens, rotary_pos_emb.squeeze(0))
+                out = apply_rotary_pos_emb_thd(t, cu_seqlens, rotary_pos_emb.squeeze(0))
                 return out[cp_rank * seq_len : (cp_rank + 1) * seq_len]
 
         q_pos_emb = fuse_rope(q_pos_emb, cu_seqlens_q, gathered=False)
@@ -921,7 +919,7 @@ class DSAMLASelfAttention(DSAMultiLatentAttention):
             index_q = gather_from_sequence_parallel_region(index_q)
 
         index_k, _ = self.wk(hidden_states)
-        index_k = self.k_norm(index_k.squeeze(1).float()).bfloat16()
+        index_k = layer_norm_fp32(self.k_norm, index_k.squeeze(1))
 
         if self.config.sequence_parallel:
             index_k = gather_from_sequence_parallel_region(index_k)

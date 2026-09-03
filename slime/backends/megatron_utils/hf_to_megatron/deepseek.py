@@ -33,6 +33,20 @@ def _dsa_reorder(name: str, tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _source_layer(config, runtime_layer: int) -> int:
+    """Resolve a compact runtime layer to its source checkpoint layer."""
+
+    layer_index_map = getattr(config, "layer_index_map", None)
+    if layer_index_map is None:
+        return runtime_layer
+    if runtime_layer < 0 or runtime_layer >= len(layer_index_map):
+        raise IndexError(
+            f"runtime layer {runtime_layer} is outside layer_index_map "
+            f"(size {len(layer_index_map)})"
+        )
+    return int(layer_index_map[runtime_layer])
+
+
 def _layer_tensor(
     layer: int,
     rest: str,
@@ -103,7 +117,10 @@ def deepseek_hf_tensor(name: str, reader: SafetensorReader, config) -> torch.Ten
     mtp = re.fullmatch(r"mtp\.layers\.(\d+)\.(.+)", name)
     if mtp:
         mtp_layer, rest = mtp.groups()
-        layer = config.num_hidden_layers + int(mtp_layer)
+        first_mtp_source_layer = getattr(
+            config, "nextn_source_layer", config.num_hidden_layers
+        )
+        layer = int(first_mtp_source_layer) + int(mtp_layer)
         mapping = {
             "eh_proj.weight": "eh_proj.weight",
             "enorm.weight": "enorm.weight",
@@ -117,7 +134,7 @@ def deepseek_hf_tensor(name: str, reader: SafetensorReader, config) -> torch.Ten
         match = re.fullmatch(r"decoder\.layers\.(\d+)\.(.+)", name)
         if not match:
             raise KeyError(f"Unsupported DeepSeek Megatron parameter {name!r}")
-        layer, rest = int(match.group(1)), match.group(2)
+        layer, rest = _source_layer(config, int(match.group(1))), match.group(2)
 
     return _layer_tensor(
         int(layer),

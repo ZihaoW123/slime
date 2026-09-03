@@ -602,7 +602,12 @@ class MegatronTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_updatable_num_new_engines.remote())
 
-        with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
+        # NPU train actors use torch_memory_saver's Python hook mode.  In that
+        # mode only allocations made inside an explicit region are pauseable,
+        # so update buffers are already in the regular pool and disable() would
+        # raise because no global preload region is active.
+        disable_tms = self.args.offload_train and accelerator.device_type() != "npu"
+        with torch_memory_saver.disable() if disable_tms else nullcontext():
             print_memory("before update_weights")
             self.weight_updater.update_weights()
             print_memory("after update_weights")
