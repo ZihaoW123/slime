@@ -33,7 +33,13 @@ class CUDAAccelerator(TorchAccelerator):
         if capability == "bf16":
             checker = getattr(torch.cuda, "is_bf16_supported", None)
             return bool(checker and checker())
-        if capability in {"cuda_int4_extension", "sglang_fp8_utils", "strict_fp32_logits", "triton_kernels"}:
+        if capability in {
+            "cuda_int4_extension",
+            "host_empty_cache",
+            "sglang_fp8_utils",
+            "strict_fp32_logits",
+            "triton_kernels",
+        }:
             return True
         if capability == "requires_cpu_initialization":
             return torch.version.hip is not None

@@ -1966,8 +1966,17 @@ def slime_validate_args(args):
         args.offload_train = True
 
     if args.offload_train:
-        args.disable_grad_buffers_cpu_backup = True
         args.disable_param_buffers_cpu_backup = True
+        # On Ascend, keeping the (BF16) gradient buffer in the regular allocator
+        # avoids asking torch-memory-saver for one very large contiguous physical
+        # allocation.  The parameter buffer still lives in the pauseable pool and
+        # is restored from TensorBackuper after wake-up.
+        args.disable_grad_buffers_cpu_backup = args.sglang_device != "npu"
+        if args.sglang_device == "npu":
+            logger.info(
+                "NPU train offload keeps gradient buffers resident and only "
+                "places parameter buffers in the torch-memory-saver pool."
+            )
 
     if args.eval_function_path is None:
         args.eval_function_path = args.rollout_function_path

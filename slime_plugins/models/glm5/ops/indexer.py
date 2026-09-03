@@ -15,8 +15,37 @@ try:  # noqa: SIM105
 except Exception:
     pass
 
-from .tilelang_indexer_bwd import indexer_bwd_interface
-from .tilelang_indexer_fwd import indexer_fwd_interface
+try:
+    from .tilelang_indexer_bwd import indexer_bwd_interface
+    from .tilelang_indexer_fwd import indexer_fwd_interface
+except ModuleNotFoundError as exc:
+    if exc.name != "tilelang":
+        raise
+    indexer_bwd_interface = None
+    indexer_fwd_interface = None
+
+
+def _pytorch_indexer_logits(
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    weights: torch.Tensor,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+) -> torch.Tensor:
+    """Portable DSA indexer used when TileLang is unavailable (notably NPU)."""
+    if index_k.ndim == 3:
+        if index_k.shape[1] != 1:
+            raise ValueError(f"Expected one indexer KV head, got {index_k.shape}")
+        index_k = index_k.squeeze(1)
+    logits = torch.einsum(
+        "qhd,kd,qh->qk",
+        index_q.float(),
+        index_k.float(),
+        weights.float(),
+    )
+    key_positions = torch.arange(index_k.shape[0], device=index_q.device).unsqueeze(0)
+    valid = (key_positions >= starts.long().unsqueeze(1)) & (key_positions < ends.long().unsqueeze(1))
+    return logits.masked_fill(~valid, float("-inf"))
 
 
 def _sglang_fp8_indexer_logits(
@@ -140,7 +169,7 @@ class IndexerFunction(torch.autograd.Function):
                 cu_seqlen_ks,
                 cu_seqlen_ke,
             )
-        else:
+        elif indexer_fwd_interface is not None:
             logits = indexer_fwd_interface(
                 index_q,
                 index_k,
@@ -148,6 +177,14 @@ class IndexerFunction(torch.autograd.Function):
                 cu_seqlen_ks,
                 cu_seqlen_ke,
                 clean_logits=True,
+            )
+        else:
+            logits = _pytorch_indexer_logits(
+                index_q,
+                index_k,
+                weights,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
             )
         if topk_indices is None:
             index_score, topk_indices = pytorch_topk_with_invalid_padding(logits, topk)
@@ -164,13 +201,32 @@ class IndexerFunction(torch.autograd.Function):
         ctx.save_for_backward(index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, topk_indices)
         ctx.topk = topk
         ctx.head_num = head_num
+        ctx.use_pytorch_fallback = indexer_fwd_interface is None and os.getenv(
+            "MEGATRON_USE_SGLANG_FP8_INDEXER", "0"
+        ) != "1"
         return index_score, topk_indices
 
     @staticmethod
     def backward(ctx, grad_scores, grad_indices):
         index_q, index_k, weights, cu_seqlen_ks, cu_seqlen_ke, topk_indices = ctx.saved_tensors
-        grad_q, grad_w, grad_k = indexer_bwd_interface(index_q, weights, index_k, topk_indices, grad_scores)
-        return grad_q, grad_k, grad_w, None, None, None, None, None, None, None
+        if ctx.use_pytorch_fallback:
+            with torch.enable_grad():
+                q = index_q.detach().requires_grad_(index_q.requires_grad)
+                k = index_k.detach().requires_grad_(index_k.requires_grad)
+                w = weights.detach().requires_grad_(weights.requires_grad)
+                logits = _pytorch_indexer_logits(q, k, w, cu_seqlen_ks, cu_seqlen_ke)
+                scores = pytorch_extract_topk_scores(logits, topk_indices)
+                grad_q, grad_k, grad_w = torch.autograd.grad(
+                    scores,
+                    (q, k, w),
+                    grad_scores,
+                    allow_unused=True,
+                )
+        else:
+            grad_q, grad_w, grad_k = indexer_bwd_interface(
+                index_q, weights, index_k, topk_indices, grad_scores
+            )
+        return grad_q, grad_k, grad_w, None, None, None, None
 
 
 def lighting_indexer(

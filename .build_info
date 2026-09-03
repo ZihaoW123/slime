@@ -1,0 +1,7 @@
+# slime-ascend 构建信息
+build_time=2026-09-02T11:53:03Z
+upstream_commit=3778dbf6d1a533ab478ecf5ddaa11449a47752b2
+upstream_version=v0.3.2
+patches_npu_compat=7
+patches_upstream_fixes=1
+patches_features=1

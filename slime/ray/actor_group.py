@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import time
@@ -8,6 +9,50 @@ from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, add_default_ray_env_vars
+from slime.utils import accelerator
+
+
+logger = logging.getLogger(__name__)
+
+
+def _configure_train_offload_env(args, env_vars: dict[str, str]) -> None:
+    """Configure the preload memory-saver hook used by train offload.
+
+    The NPU build supports its Python ``torch`` hook mode, but its preload mode
+    aborts while a Ray train actor initializes in this environment.  Therefore
+    NPU actors use the Python hook selected by torch_memory_saver itself and do
+    not inherit LD_PRELOAD.  pause/resume remain fully functional.
+    """
+    if not args.offload_train:
+        return
+    if accelerator.device_type() == "npu":
+        logger.warning(
+            "Skipping torch_memory_saver preload mode for NPU train actor; "
+            "using its Python torch hook mode"
+        )
+        return
+
+    import torch_memory_saver
+
+    for path in [
+        "torch_memory_saver_hook_mode_preload_cu13.abi3.so",
+        "torch_memory_saver_hook_mode_preload_cu12.abi3.so",
+        "torch_memory_saver_hook_mode_preload.abi3.so",
+    ]:
+        dynlib_path = os.path.join(
+            os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
+            path,
+        )
+        if os.path.exists(dynlib_path):
+            break
+    else:
+        raise FileNotFoundError(
+            "Cannot find torch_memory_saver dynamic library. Please make sure torch_memory_saver is properly installed."
+        )
+
+    env_vars["LD_PRELOAD"] = dynlib_path
+    env_vars["TMS_INIT_ENABLE"] = "1"
+    env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
 
 
 class RayTrainGroup:
@@ -70,28 +115,7 @@ class RayTrainGroup:
             **self.args.train_env_vars,
         }
 
-        if self.args.offload_train:
-            import torch_memory_saver
-
-            for path in [
-                "torch_memory_saver_hook_mode_preload_cu13.abi3.so",
-                "torch_memory_saver_hook_mode_preload_cu12.abi3.so",
-                "torch_memory_saver_hook_mode_preload.abi3.so",
-            ]:
-                dynlib_path = os.path.join(
-                    os.path.dirname(os.path.dirname(torch_memory_saver.__file__)),
-                    path,
-                )
-                if os.path.exists(dynlib_path):
-                    break
-            else:
-                raise FileNotFoundError(
-                    "Cannot find torch_memory_saver dynamic library. Please make sure torch_memory_saver is properly installed."
-                )
-
-            env_vars["LD_PRELOAD"] = dynlib_path
-            env_vars["TMS_INIT_ENABLE"] = "1"
-            env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
+        _configure_train_offload_env(self.args, env_vars)
 
         # We cannot do routing replay for critic.
         if self.args.use_routing_replay and self.role == "actor":
@@ -105,7 +129,7 @@ class RayTrainGroup:
             actor_impl = self._actor_cls
 
         actor_options = {
-            "num_gpus": 1,
+            **accelerator.ray_remote_options(1),
             "runtime_env": {"env_vars": add_default_ray_env_vars(env_vars)},
         }
         if getattr(self.args, "rollout_data_transport", "object-store") == "nixl":
@@ -118,7 +142,7 @@ class RayTrainGroup:
         for rank in range(world_size):
             actor = TrainRayActor.options(
                 num_cpus=num_gpus_per_actor,
-                num_gpus=num_gpus_per_actor,
+                **accelerator.ray_remote_options(num_gpus_per_actor),
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=reordered_bundle_indices[rank],

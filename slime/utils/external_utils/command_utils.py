@@ -12,10 +12,28 @@ from pathlib import Path
 
 from slime.utils.external_utils.typer_utils import dataclass_cli
 from slime.utils.misc import exec_command
+from slime.utils import accelerator
 
 _ = exec_command, dataclass_cli
 
 repo_base_dir = Path(os.path.abspath(__file__)).resolve().parents[3]
+
+
+def _dependency_pythonpath() -> str:
+    """Return explicit dependency roots while preserving legacy container defaults."""
+    dependency_paths = [
+        os.environ.get("SLIME_MEGATRON_ROOT", "/workspace/Megatron-LM"),
+        os.path.join(
+            os.environ.get("SLIME_MEGATRON_BRIDGE_ROOT", "/workspace/Megatron-Bridge"),
+            "src",
+        ),
+        os.environ.get("SLIME_MEGATRON_ADAPTOR_ROOT", "/workspace/MegatronAdaptor"),
+        os.environ.get("SLIME_TRANSFORMER_ENGINE_NPU_ROOT", "/workspace/TransformerEngineNPU"),
+    ]
+    inherited = os.environ.get("PYTHONPATH", "")
+    if inherited:
+        dependency_paths.append(inherited)
+    return ":".join(dependency_paths)
 
 
 def convert_checkpoint(
@@ -52,7 +70,7 @@ def convert_checkpoint(
 
     exec_command(
         f"source {repo_base_dir}/scripts/models/{megatron_model_type}.sh && "
-        f"PYTHONPATH={repo_base_dir}:/root/Megatron-LM:${{PYTHONPATH:-}} "
+        f"PYTHONPATH={_dependency_pythonpath()} "
         f"torchrun "
         f"--nproc-per-node {num_gpus_per_node} "
         f"{multinode_args}"
@@ -106,6 +124,8 @@ def execute_train(
         config = ExecuteTrainConfig()
     external_ray = get_bool_env_var("SLIME_SCRIPT_EXTERNAL_RAY")
     master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+    ray_port = int(os.environ.get("SLIME_RAY_PORT", "6379"))
+    ray_dashboard_port = int(os.environ.get("SLIME_RAY_DASHBOARD_PORT", "8265"))
 
     exec_command(
         "pkill -9 sglang; "
@@ -125,11 +145,20 @@ def execute_train(
     )
 
     if not external_ray:
+        resource_name = accelerator.ray_resource_name()
+        device_resources = (
+            f"--num-gpus {num_gpus_per_node}"
+            if resource_name == "GPU"
+            else f"--resources='{{\"{resource_name}\": {num_gpus_per_node}}}'"
+        )
         exec_command(
             # will prevent ray from buffering stdout/stderr
             f"export PYTHONUNBUFFERED=1 && "
-            f"ray start --head --node-ip-address {master_addr} --num-gpus {num_gpus_per_node} --disable-usage-stats"
+            f"ray start --head --node-ip-address {master_addr} --port {ray_port} "
+            f"--dashboard-port {ray_dashboard_port} {device_resources} --disable-usage-stats"
         )
+        # `ray start` can return before the dashboard job agent has registered.
+        time.sleep(5)
 
     if (f := before_ray_job_submit) is not None:
         f()
@@ -137,13 +166,28 @@ def execute_train(
     runtime_env_json = json.dumps(
         {
             "env_vars": {
-                "PYTHONPATH": "/root/Megatron-LM/",
-                "RAY_USE_UVLOOP": "0",
+                "PYTHONPATH": _dependency_pythonpath(),
+                "SLIME_ENABLE_PROFILING": "False",
+                "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+                "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
+                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
                 "CUDA_DEVICE_MAX_CONNECTIONS": "1",
                 "NCCL_NVLS_ENABLE": str(int(check_has_nvlink())),
                 "no_proxy": f"127.0.0.1,{master_addr}",
                 # This is needed by megatron / torch distributed in multi-node setup
                 "MASTER_ADDR": master_addr,
+                "HCCL_DETERMINISTIC": "True",
+                "HCCL_BUFFSIZE": os.environ.get("HCCL_BUFFSIZE", "512"),
+                "LCCL_DETERMINISTIC": "1",
+                "CLOSE_MATMUL_K_SHIFT": "1",
+                "ATB_LLM_LCOC_ENABLE": "0",
+                "ASCEND_COREDUMP_SIGNAL": os.environ.get("ASCEND_COREDUMP_SIGNAL", "none"),
+                "HCCL_HOST_SOCKET_PORT_RANGE": os.environ.get(
+                    "HCCL_HOST_SOCKET_PORT_RANGE", "60000-60050"
+                ),
+                "HCCL_NPU_SOCKET_PORT_RANGE": os.environ.get(
+                    "HCCL_NPU_SOCKET_PORT_RANGE", "61000-61050"
+                ),
                 **(
                     {
                         "CUDA_ENABLE_COREDUMP_ON_EXCEPTION": "1",
@@ -169,7 +213,7 @@ def execute_train(
         exec_command(
             f"export no_proxy=127.0.0.1 && export PYTHONUNBUFFERED=1 && "
             f"{cmd_megatron_model_source}"
-            f'ray job submit --address="http://127.0.0.1:8265" '
+            f'ray job submit --address="http://127.0.0.1:{ray_dashboard_port}" '
             f"--runtime-env-json='{runtime_env_json}' "
             f"-- python3 {train_script} "
             f"{'${MODEL_ARGS[@]}' if megatron_model_type is not None else ''} "

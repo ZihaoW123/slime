@@ -20,6 +20,7 @@ class Accelerator(abc.ABC):
     name: str
     device_type: str
     communication_backend_name: str
+    ray_resource_name: str = "GPU"
 
     @abc.abstractmethod
     def is_available(self) -> bool:

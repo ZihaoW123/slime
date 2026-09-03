@@ -19,7 +19,11 @@ logger = logging.getLogger(__name__)
 
 
 def get_local_gpu_id():
-    return accelerator.resolve_visible_device_id(ray.get_gpu_ids()[0])
+    resource_name = accelerator.ray_resource_name()
+    resource_ids = ray.get_runtime_context().get_accelerator_ids().get(resource_name, [])
+    if not resource_ids:
+        raise RuntimeError(f"Ray did not assign a {resource_name} accelerator to this actor")
+    return accelerator.resolve_visible_device_id(resource_ids[0])
 
 
 class TrainRayActor(RayActor):

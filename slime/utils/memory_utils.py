@@ -14,7 +14,7 @@ def clear_memory(clear_host_memory: bool = False):
     accelerator.synchronize()
     gc.collect()
     accelerator.empty_cache()
-    if clear_host_memory:
+    if clear_host_memory and accelerator.supports("host_empty_cache"):
         torch._C._host_emptyCache()
 
 

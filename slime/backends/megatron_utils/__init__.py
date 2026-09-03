@@ -1,14 +1,31 @@
+import ctypes
 import logging
+from pathlib import Path
 
 import torch
 
 from slime.utils import accelerator
 
-accelerator.initialize_accelerator()
+selected_accelerator = accelerator.initialize_accelerator()
+if selected_accelerator is not None:
+    selected_accelerator.post_import_torch()
 
 try:
     import deep_ep
     from torch_memory_saver import torch_memory_saver
+
+    if (
+        selected_accelerator is not None
+        and selected_accelerator.device_type == "npu"
+        and getattr(deep_ep, "__file__", None)
+    ):
+        deep_ep_opapi = (
+            Path(deep_ep.__file__).resolve().parent
+            / "vendors/hwcomputing/op_api/lib/libcust_opapi.so"
+        )
+        if not deep_ep_opapi.exists():
+            raise ImportError(f"Cannot find DeepEP custom operator library: {deep_ep_opapi}")
+        _deep_ep_opapi_handle = ctypes.CDLL(str(deep_ep_opapi), mode=ctypes.RTLD_GLOBAL)
 
     old_init = deep_ep.Buffer.__init__
 

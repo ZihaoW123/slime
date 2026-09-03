@@ -22,6 +22,8 @@ from .base import Accelerator
 from .cuda import CUDAAccelerator
 from .musa import MUSAAccelerator
 from .musa import is_musa_available as _is_musa_available
+from .npu import NPUAccelerator
+from .npu import is_npu_available as _is_npu_available
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +96,10 @@ def is_musa_environment() -> bool:
     )
 
 
+def is_npu_available() -> bool:
+    return _is_npu_available()
+
+
 def _try_import_musa_patch() -> bool:
     global _MUSA_PATCH_IMPORTED
     if _MUSA_PATCH_IMPORTED:
@@ -136,6 +142,8 @@ def _register_builtin_backends() -> None:
         register_accelerator(
             "musa", MUSAAccelerator, is_musa_available, priority=200, communication_backends=("mccl",)
         )
+    if "npu" not in _REGISTRY:
+        register_accelerator("npu", NPUAccelerator, is_npu_available, priority=300, communication_backends=("hccl",))
 
 
 def _requested_name() -> str | None:
@@ -144,6 +152,8 @@ def _requested_name() -> str | None:
         return value.strip().lower()
     if _musa_requested():
         return "musa"
+    if is_npu_available() or "ASCEND_RT_VISIBLE_DEVICES" in os.environ:
+        return "npu"
     return None
 
 
@@ -388,6 +398,18 @@ def weight_update_backend(default: str = "nccl") -> str:
 
 def visible_devices_env_key() -> str:
     return _backend().visible_devices_env
+
+
+def ray_resource_name() -> str:
+    return _backend().ray_resource_name
+
+
+def ray_remote_options(amount: float) -> dict[str, Any]:
+    """Return Ray actor options for the selected accelerator resource."""
+    resource_name = ray_resource_name()
+    if resource_name == "GPU":
+        return {"num_gpus": amount}
+    return {"resources": {resource_name: amount}}
 
 
 def resolve_visible_device_id(physical_device_id: int | float | str) -> int:
