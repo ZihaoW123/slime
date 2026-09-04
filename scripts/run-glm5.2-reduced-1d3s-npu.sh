@@ -9,7 +9,7 @@ ulimit -n 65535
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
-WORK_ROOT="/mnt/share/w00934247/project/glm_032"
+WORK_ROOT="${WORK_ROOT:-/mnt/share/w00934247/project/glm_032}"
 MEGATRON_ROOT="${WORK_ROOT}/Megatron-LM"
 SGLANG_PYTHON_ROOT="${WORK_ROOT}/sglang/python"
 MODEL_PATH="${GLM52_REDUCED_MODEL:-${WORK_ROOT}/GLM-5.2-reduced-1d3s}"
@@ -28,28 +28,89 @@ fi
 
 source "${SCRIPT_DIR}/models/glm5.2-reduced-1d3s.sh"
 set +u
-source /mnt/share/w00934247/cann_envs/cann910/cann-9.1.0/set_env.sh
-source /mnt/share/w00934247/cann_envs/cann910/nnal/atb/set_env.sh
-source /mnt/share/w00934247/cann_envs/cann910/nnal/asdsip/set_env.sh
 eval "$(conda shell.bash hook)"
-conda activate /mnt/share/w00934247/conda_envs/glm52_env
+conda activate "${CONDA_ENV:-/mnt/share/w00934247/conda_envs/glm52_env}"
+
+# Conda activation can replace loader variables, so load CANN afterwards.
+# Prefer the A5 installation used by the known-good smoke launcher, while
+# retaining the 179 installation as a fallback.
+if [[ -z "${CANN_ROOT:-}" ]]; then
+    for candidate in \
+        /mnt/share/w00934247/cann/cann910/ascend-toolkit \
+        /mnt/share/w00934247/cann_envs/cann910/cann-9.1.0; do
+        if [[ -f "${candidate}/set_env.sh" ]]; then
+            CANN_ROOT="${candidate}"
+            break
+        fi
+    done
+fi
+if [[ -z "${CANN_ROOT:-}" || ! -f "${CANN_ROOT}/set_env.sh" ]]; then
+    echo "Cannot find CANN set_env.sh; set CANN_ROOT explicitly." >&2
+    exit 1
+fi
+
+CANN_BASE="$(dirname -- "${CANN_ROOT}")"
+ATB_ENV="${ATB_ENV:-${CANN_BASE}/nnal/atb/set_env.sh}"
+ASDSIP_ENV="${ASDSIP_ENV:-${CANN_BASE}/nnal/asdsip/set_env.sh}"
+source "${CANN_ROOT}/set_env.sh"
+if [[ -f "${ATB_ENV}" ]]; then
+    source "${ATB_ENV}"
+fi
+if [[ -f "${ASDSIP_ENV}" ]]; then
+    source "${ASDSIP_ENV}"
+fi
 set -u
+
+if [[ -z "${LD_LIBRARY_PATH:-}" ]]; then
+    echo "LD_LIBRARY_PATH is empty after loading CANN." >&2
+    exit 1
+fi
 
 export ASCEND_RT_VISIBLE_DEVICES="${NPU_DEVICES}"
 # A5 requires standard-format weights; ACL-format weights fail at runtime.
 export SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT=1
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${PROJECT_ROOT}:${MEGATRON_ROOT}:${SGLANG_PYTHON_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+
+# A5 must use its routable host interface for HCCL root-info detection.  Keep
+# loopback as a fallback for machines (such as the original 179 setup) that do
+# not expose the A5 interface.
+SOCKET_IFNAME="${SOCKET_IFNAME:-}"
+if [[ -z "${SOCKET_IFNAME}" ]]; then
+    if ip -4 -o addr show dev enp35s0f2 scope global 2>/dev/null | grep -q .; then
+        SOCKET_IFNAME=enp35s0f2
+    else
+        SOCKET_IFNAME=lo
+    fi
+fi
+if [[ "${SOCKET_IFNAME}" == lo ]]; then
+    CURRENT_IP=127.0.0.1
+else
+    CURRENT_IP="$(
+        ip -4 -o addr show dev "${SOCKET_IFNAME}" scope global 2>/dev/null |
+            awk 'NR == 1 {split($4, ip, "/"); print ip[1]}'
+    )"
+fi
+if [[ -z "${CURRENT_IP}" ]]; then
+    echo "Cannot obtain an IPv4 address from ${SOCKET_IFNAME}." >&2
+    exit 1
+fi
+
+export MASTER_ADDR="${MASTER_ADDR:-${CURRENT_IP}}"
 export MASTER_PORT="${MASTER_PORT:-29500}"
 RAY_PORT="${RAY_PORT:-6382}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8267}"
 RAY_TMP_DIR="${RAY_TMP_DIR:-/tmp/ray-glm52-reduced-1d3s}"
-export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-lo}"
-export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-lo}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${SOCKET_IFNAME}}"
+export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-${SOCKET_IFNAME}}"
+export TP_SOCKET_IFNAME="${TP_SOCKET_IFNAME:-${SOCKET_IFNAME}}"
 export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-1024}"
-export HCCL_HOST_SOCKET_PORT_RANGE="${HCCL_HOST_SOCKET_PORT_RANGE:-auto}"
-export HCCL_NPU_SOCKET_PORT_RANGE="${HCCL_NPU_SOCKET_PORT_RANGE:-auto}"
+export HCCL_HOST_SOCKET_PORT_RANGE="${HCCL_HOST_SOCKET_PORT_RANGE:-50000-52999}"
+export HCCL_NPU_SOCKET_PORT_RANGE="${HCCL_NPU_SOCKET_PORT_RANGE:-60000-62999}"
+export HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-7200}"
+export HCCL_EXEC_TIMEOUT="${HCCL_EXEC_TIMEOUT:-7200}"
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+export RAY_DEDUP_LOGS=0
 export INDEXER_ROPE_NEOX_STYLE=0
 # SGLang must put target/draft weights and KV caches in its NPU memory-saver
 # pool so /release_memory_occupation can make room for the colocated trainer.
@@ -166,6 +227,44 @@ MISC_ARGS=(
     --update-weight-buffer-size 2147483648
 )
 
+# Ray actors have their own runtime environment.  Pass the CANN loader and
+# host-communication settings explicitly so a reused daemon or nested Ray job
+# cannot silently fall back to lo or an empty LD_LIBRARY_PATH.
+TRAIN_ENV_VARS=$(python3 - <<'PY_TRAIN_ENV'
+import json
+import os
+
+env = {
+    key: os.environ[key]
+    for key in (
+        "PATH",
+        "PYTHONPATH",
+        "LD_LIBRARY_PATH",
+        "ASCEND_HOME_PATH",
+        "ASCEND_OPP_PATH",
+        "HCCL_SOCKET_IFNAME",
+        "GLOO_SOCKET_IFNAME",
+        "TP_SOCKET_IFNAME",
+    )
+    if key in os.environ
+}
+env.update(
+    {
+        "HCCL_HOST_SOCKET_PORT_RANGE": os.environ.get(
+            "TRAIN_HCCL_HOST_SOCKET_PORT_RANGE", "53000-53999"
+        ),
+        "HCCL_NPU_SOCKET_PORT_RANGE": os.environ.get(
+            "TRAIN_HCCL_NPU_SOCKET_PORT_RANGE", "63000-63999"
+        ),
+        "HCCL_CONNECT_TIMEOUT": os.environ["HCCL_CONNECT_TIMEOUT"],
+        "HCCL_EXEC_TIMEOUT": os.environ["HCCL_EXEC_TIMEOUT"],
+    }
+)
+print(json.dumps(env))
+PY_TRAIN_ENV
+)
+MISC_ARGS+=(--train-env-vars "${TRAIN_ENV_VARS}")
+
 TRAIN_ARGS=(
     "${MODEL_ARGS[@]}"
     "${CKPT_ARGS[@]}"
@@ -205,24 +304,65 @@ fi
 if [[ "${REUSE_RAY:-0}" != 1 ]]; then
     ray start --head --port "${RAY_PORT}" --node-ip-address "${MASTER_ADDR}" \
         --resources='{"NPU": 8}' \
+        --num-gpus 8 \
         --num-cpus 32 \
         --temp-dir="${RAY_TMP_DIR}" --min-worker-port=30000 --max-worker-port=30999 \
         --disable-usage-stats --dashboard-host=127.0.0.1 --dashboard-port="${RAY_DASHBOARD_PORT}"
 fi
 
-for _ in $(seq 1 30); do
-    if curl --silent --fail "http://127.0.0.1:${RAY_DASHBOARD_PORT}/api/jobs/" >/dev/null; then
-        break
-    fi
-    sleep 2
-done
-curl --silent --fail "http://127.0.0.1:${RAY_DASHBOARD_PORT}/api/jobs/" >/dev/null || {
-    echo "Ray dashboard job agent did not become ready on port ${RAY_DASHBOARD_PORT}." >&2
-    exit 1
+echo "HCCL bootstrap: interface=${HCCL_SOCKET_IFNAME}, master=${MASTER_ADDR}"
+
+# Direct launch matches the A5 configuration known to work and preserves the
+# fully initialized CANN environment.  Ray Job mode remains available for
+# callers that explicitly need it.
+if [[ "${USE_RAY_JOB:-0}" == 1 ]]; then
+    for _ in $(seq 1 30); do
+        if curl --silent --fail "http://127.0.0.1:${RAY_DASHBOARD_PORT}/api/jobs/" >/dev/null; then
+            break
+        fi
+        sleep 2
+    done
+    curl --silent --fail "http://127.0.0.1:${RAY_DASHBOARD_PORT}/api/jobs/" >/dev/null || {
+        echo "Ray dashboard job agent did not become ready on port ${RAY_DASHBOARD_PORT}." >&2
+        exit 1
+    }
+
+    RUNTIME_ENV_JSON=$(python3 - <<'PY_RUNTIME_ENV'
+import json
+import os
+
+names = {
+    "ASCEND_RT_VISIBLE_DEVICES",
+    "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT",
+    "PYTHONPATH",
+    "PYTHONUNBUFFERED",
+    "PATH",
+    "LD_LIBRARY_PATH",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "GLOO_SOCKET_IFNAME",
+    "HCCL_SOCKET_IFNAME",
+    "TP_SOCKET_IFNAME",
+    "HCCL_BUFFSIZE",
+    "HCCL_HOST_SOCKET_PORT_RANGE",
+    "HCCL_NPU_SOCKET_PORT_RANGE",
+    "HCCL_CONNECT_TIMEOUT",
+    "HCCL_EXEC_TIMEOUT",
+    "INDEXER_ROPE_NEOX_STYLE",
+    "SLIME_NPU_ENABLE_SGLANG_MEMORY_SAVER",
 }
+names.update(
+    key
+    for key in os.environ
+    if key.startswith(("ASCEND_", "ATB_", "TBE_"))
+)
+print(json.dumps({"env_vars": {key: os.environ[key] for key in names if key in os.environ}}))
+PY_RUNTIME_ENV
+    )
 
-RUNTIME_ENV_JSON=$(python -c 'import json, os; print(json.dumps({"env_vars": {key: os.environ[key] for key in ["ASCEND_RT_VISIBLE_DEVICES", "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT", "PYTHONPATH", "PYTHONUNBUFFERED", "MASTER_ADDR", "MASTER_PORT", "GLOO_SOCKET_IFNAME", "HCCL_SOCKET_IFNAME", "HCCL_BUFFSIZE", "HCCL_HOST_SOCKET_PORT_RANGE", "HCCL_NPU_SOCKET_PORT_RANGE", "INDEXER_ROPE_NEOX_STYLE", "SLIME_NPU_ENABLE_SGLANG_MEMORY_SAVER"]}}))')
-
-ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
-    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-    -- python train.py "${TRAIN_ARGS[@]}"
+    ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
+        --runtime-env-json="${RUNTIME_ENV_JSON}" \
+        -- python train.py "${TRAIN_ARGS[@]}"
+else
+    python3 train.py "${TRAIN_ARGS[@]}"
+fi
