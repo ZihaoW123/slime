@@ -10,6 +10,8 @@ ulimit -n 65535
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 PROJECT_ROOT="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
 WORK_ROOT="/mnt/share/w00934247/project/glm_032"
+MEGATRON_ROOT="${WORK_ROOT}/Megatron-LM"
+SGLANG_PYTHON_ROOT="${WORK_ROOT}/sglang/python"
 MODEL_PATH="${GLM52_REDUCED_MODEL:-${WORK_ROOT}/GLM-5.2-reduced-1d3s}"
 PROMPT_DATA="${GLM52_PROMPT_DATA:-${SCRIPT_DIR}/data/glm52-reduced-smoke.jsonl}"
 SAVE_PATH="${GLM52_SAVE_PATH:-${PROJECT_ROOT}/outputs/glm52-reduced-1d3s}"
@@ -34,8 +36,10 @@ conda activate /mnt/share/w00934247/conda_envs/glm52_env
 set -u
 
 export ASCEND_RT_VISIBLE_DEVICES="${NPU_DEVICES}"
+# A5 requires standard-format weights; ACL-format weights fail at runtime.
+export SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT=1
 export PYTHONUNBUFFERED=1
-export PYTHONPATH="${PROJECT_ROOT}:${WORK_ROOT}/Megatron-LM:${WORK_ROOT}/MegatronAdaptor:${WORK_ROOT}/sglang/python${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${PROJECT_ROOT}:${MEGATRON_ROOT}:${SGLANG_PYTHON_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export MASTER_PORT="${MASTER_PORT:-29500}"
 RAY_PORT="${RAY_PORT:-6382}"
@@ -55,8 +59,8 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 CKPT_ARGS=(
     --hf-checkpoint "${MODEL_PATH}"
     --load "${MODEL_PATH}"
-    --save "${SAVE_PATH}"
-    --save-interval 20
+    # --save "${SAVE_PATH}"
+    # --save-interval 20
 )
 
 ROLLOUT_ARGS=(
@@ -217,7 +221,7 @@ curl --silent --fail "http://127.0.0.1:${RAY_DASHBOARD_PORT}/api/jobs/" >/dev/nu
     exit 1
 }
 
-RUNTIME_ENV_JSON=$(python -c 'import json, os; print(json.dumps({"env_vars": {key: os.environ[key] for key in ["ASCEND_RT_VISIBLE_DEVICES", "PYTHONPATH", "PYTHONUNBUFFERED", "MASTER_ADDR", "MASTER_PORT", "GLOO_SOCKET_IFNAME", "HCCL_SOCKET_IFNAME", "HCCL_BUFFSIZE", "HCCL_HOST_SOCKET_PORT_RANGE", "HCCL_NPU_SOCKET_PORT_RANGE", "INDEXER_ROPE_NEOX_STYLE", "SLIME_NPU_ENABLE_SGLANG_MEMORY_SAVER"]}}))')
+RUNTIME_ENV_JSON=$(python -c 'import json, os; print(json.dumps({"env_vars": {key: os.environ[key] for key in ["ASCEND_RT_VISIBLE_DEVICES", "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT", "PYTHONPATH", "PYTHONUNBUFFERED", "MASTER_ADDR", "MASTER_PORT", "GLOO_SOCKET_IFNAME", "HCCL_SOCKET_IFNAME", "HCCL_BUFFSIZE", "HCCL_HOST_SOCKET_PORT_RANGE", "HCCL_NPU_SOCKET_PORT_RANGE", "INDEXER_ROPE_NEOX_STYLE", "SLIME_NPU_ENABLE_SGLANG_MEMORY_SAVER"]}}))')
 
 ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
     --runtime-env-json="${RUNTIME_ENV_JSON}" \
