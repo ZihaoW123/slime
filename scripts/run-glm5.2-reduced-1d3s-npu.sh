@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
-# Single-node GLM-5.2 reduced-model RL smoke run on physical NPUs 8..15.
+# Single-node GLM-5.2 reduced-model RL smoke run on eight NPUs.  A 16-NPU
+# host defaults to physical devices 8..15; an 8-NPU host defaults to 0..7.
 # The reduced HF directory contains metadata plus symlinks to the immutable
 # full checkpoint. Set DRY_RUN=1 to validate and print the launch command.
 
@@ -15,7 +16,19 @@ SGLANG_PYTHON_ROOT="${WORK_ROOT}/sglang/python"
 MODEL_PATH="${GLM52_REDUCED_MODEL:-${WORK_ROOT}/GLM-5.2-reduced-1d3s}"
 PROMPT_DATA="${GLM52_PROMPT_DATA:-${SCRIPT_DIR}/data/glm52-reduced-smoke.jsonl}"
 SAVE_PATH="${GLM52_SAVE_PATH:-${PROJECT_ROOT}/outputs/glm52-reduced-1d3s}"
-NPU_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-8,9,10,11,12,13,14,15}"
+if [[ -n "${ASCEND_RT_VISIBLE_DEVICES:-}" ]]; then
+    NPU_DEVICES="${ASCEND_RT_VISIBLE_DEVICES}"
+elif [[ -e /dev/davinci15 ]]; then
+    NPU_DEVICES="8,9,10,11,12,13,14,15"
+else
+    NPU_DEVICES="0,1,2,3,4,5,6,7"
+fi
+
+IFS=',' read -r -a NPU_DEVICE_IDS <<<"${NPU_DEVICES}"
+if [[ "${#NPU_DEVICE_IDS[@]}" -ne 8 ]]; then
+    echo "This launcher requires exactly eight visible NPUs; got ${NPU_DEVICES}." >&2
+    exit 1
+fi
 
 if [[ ! -f "${MODEL_PATH}/config.json" || ! -f "${MODEL_PATH}/model.safetensors.index.json" ]]; then
     echo "Reduced model is missing or incomplete: ${MODEL_PATH}" >&2
@@ -310,6 +323,7 @@ if [[ "${REUSE_RAY:-0}" != 1 ]]; then
         --disable-usage-stats --dashboard-host=127.0.0.1 --dashboard-port="${RAY_DASHBOARD_PORT}"
 fi
 
+echo "NPU devices: ${ASCEND_RT_VISIBLE_DEVICES}"
 echo "HCCL bootstrap: interface=${HCCL_SOCKET_IFNAME}, master=${MASTER_ADDR}"
 
 # Direct launch matches the A5 configuration known to work and preserves the
