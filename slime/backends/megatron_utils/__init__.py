@@ -4,7 +4,9 @@ import torch
 
 from slime.utils import accelerator
 
-accelerator.initialize_accelerator()
+selected_accelerator = accelerator.initialize_accelerator()
+if selected_accelerator is not None:
+    selected_accelerator.post_import_torch()
 
 try:
     import deep_ep

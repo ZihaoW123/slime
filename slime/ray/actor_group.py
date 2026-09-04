@@ -8,6 +8,7 @@ from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from slime.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST, add_default_ray_env_vars
+from slime.utils import accelerator
 
 
 class RayTrainGroup:
@@ -105,7 +106,7 @@ class RayTrainGroup:
             actor_impl = self._actor_cls
 
         actor_options = {
-            "num_gpus": 1,
+            **accelerator.ray_remote_options(1),
             "runtime_env": {"env_vars": add_default_ray_env_vars(env_vars)},
         }
         if getattr(self.args, "rollout_data_transport", "object-store") == "nixl":
@@ -118,7 +119,7 @@ class RayTrainGroup:
         for rank in range(world_size):
             actor = TrainRayActor.options(
                 num_cpus=num_gpus_per_actor,
-                num_gpus=num_gpus_per_actor,
+                **accelerator.ray_remote_options(num_gpus_per_actor),
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=reordered_bundle_indices[rank],
