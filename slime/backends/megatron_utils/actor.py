@@ -80,7 +80,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_megatron_main_rank():
             init_tracking(args, primary=False, role=role)
 
-        self.prof = TrainProfiler(args)
+        self.prof = TrainProfiler(args, role=role)
 
         # read config and tokenizer serialized to prevent concurrent writing bug.
         for i in range(args.num_gpus_per_node):
@@ -365,6 +365,7 @@ class MegatronTrainRayActor(TrainRayActor):
         data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
         global_batch_sizes = rollout_data["global_batch_sizes"]
+        self.prof.start_actor_profile(rollout_id)
 
         # Compute current critic values (used as old_values for value loss and for actor advantages).
         rollout_data.update(forward_only(get_values, self.args, self.model, data_iterator, num_microbatches))
@@ -393,6 +394,7 @@ class MegatronTrainRayActor(TrainRayActor):
         data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
         global_batch_sizes = rollout_data["global_batch_sizes"]
+        self.prof.start_actor_profile(rollout_id)
 
         if self.args.use_rollout_routing_replay:
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
-# Single-node GLM-5.2 reduced-model RL smoke run on physical NPUs 8..15.
-# The reduced HF directory contains metadata plus symlinks to the immutable
-# full checkpoint. Set DRY_RUN=1 to validate and print the launch command.
+# Single-node GLM-5.2 reduced-model RL profiler example on physical NPUs 8..15.
+# It keeps the training/rollout settings of run-glm5.2-reduced-1d3s-npu.sh and
+# profiles only rank 0 in the first rollout step to limit trace size and overhead.
+# Set PARSE_ONLY=1 to validate arguments or DRY_RUN=1 to print the command.
 
 set -euo pipefail
 ulimit -n 65535
@@ -14,7 +15,8 @@ MEGATRON_ROOT="${WORK_ROOT}/Megatron-LM"
 SGLANG_PYTHON_ROOT="${WORK_ROOT}/sglang/python"
 MODEL_PATH="${GLM52_REDUCED_MODEL:-${WORK_ROOT}/GLM-5.2-reduced-1d3s}"
 PROMPT_DATA="${GLM52_PROMPT_DATA:-${SCRIPT_DIR}/data/glm52-reduced-smoke.jsonl}"
-SAVE_PATH="${GLM52_SAVE_PATH:-${PROJECT_ROOT}/outputs/glm52-reduced-1d3s}"
+SAVE_PATH="${GLM52_SAVE_PATH:-${PROJECT_ROOT}/outputs/glm52-reduced-1d3s-profiler}"
+PROFILE_ROOT="${GLM52_PROFILE_ROOT:-${PROJECT_ROOT}/outputs/glm52-reduced-1d3s-profile}"
 NPU_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-8,9,10,11,12,13,14,15}"
 
 if [[ ! -f "${MODEL_PATH}/config.json" || ! -f "${MODEL_PATH}/model.safetensors.index.json" ]]; then
@@ -44,7 +46,7 @@ export MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
 export MASTER_PORT="${MASTER_PORT:-29500}"
 RAY_PORT="${RAY_PORT:-6382}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8267}"
-RAY_TMP_DIR="${RAY_TMP_DIR:-/tmp/ray-glm52-reduced-1d3s}"
+RAY_TMP_DIR="${RAY_TMP_DIR:-/tmp/ray-glm52-reduced-1d3s-profiler}"
 export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-lo}"
 export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-lo}"
 export HCCL_BUFFSIZE="${HCCL_BUFFSIZE:-1024}"
@@ -127,7 +129,7 @@ SGLANG_ARGS=(
     # Target + EAGLE draft weights need at least 52.5% with this SGLang build.
     --sglang-mem-fraction-static 0.55
     # The model advertises a 1M context window, which otherwise makes SGLang
-    # reserve ~2.15M KV-cache tokens per DP rank.  This smoke workload needs
+    # reserve ~2.15M KV-cache tokens per DP rank. This smoke workload needs
     # only short sequences; cap the pool so it can be restored while the
     # colocated Megatron gradient buffer remains resident.
     --sglang-max-total-tokens 32768
@@ -151,7 +153,7 @@ SGLANG_ARGS=(
 MISC_ARGS=(
     --attention-dropout 0.0
     --hidden-dropout 0.0
-    # Keep the resident gradient buffer in BF16.  FP32 doubles it to ~26 GiB
+    # Keep the resident gradient buffer in BF16. FP32 doubles it to ~26 GiB
     # per rank and leaves too little room to wake the colocated SGLang engine.
     --attention-softmax-in-fp32
     --attention-backend flash
@@ -166,6 +168,45 @@ MISC_ARGS=(
     --update-weight-buffer-size 2147483648
 )
 
+# 训练侧（Megatron actor）profiler 参数：
+# - global-step-start/end 是 RL 全局 rollout step 的左闭右开区间 [start, end)；end=-1 表示直到训练结束。
+# - ranks 是 Megatron 全局 rank；-1/不设置表示所有 rank。示例只采 rank 0，避免 8 份大 trace。
+# - level_none/level0/level1/level2 依次增加采集细节与开销，通常从 level1 开始定位算子性能。
+# - export-type=db 便于 msprof/MindStudio 分析；text 体积较轻，更适合直接查看导出文件。
+# - contents 可选 npu/cpu/memory/shapes/module/stack；memory、shapes、module、stack 会隐式采集 CPU。
+#   示例使用 PR 111 验证过的 npu+cpu 组合；额外内容会明显增大 trace 和运行时开销。
+# - analysis=true 会在停止后自动解析 trace，收尾时间和磁盘开销更高；false 只保存原始结果。
+# - save-path 是训练侧 trace 根目录。
+#
+# 推理侧（SGLang rollout）profiler 参数：
+# - global-step-start/end 同样控制哪些 RL rollout 被采集。
+# - ranks 是 SGLang engine leader rank，不是 Megatron rank；示例只采 engine rank 0。
+# - token-start/end 是单次 rollout 内 SGLang forward/profile step 的 [start, end)，不是 RL 全局 step。
+#   同时设置二者后，SGLang 在 end-start 个 step 后自动停止，Slime 不再重复调用 stop_profile。
+# - contents 可选 npu/cpu/shapes/stack/module；SGLang 当前忽略 memory，module 会映射成 stack。
+#   示例仅采 npu；当前 torch_npu/CANN 组合在多 DP worker 下采 CPU stack/shapes 可能不稳定。
+# - save-path 是推理侧根目录，每个 engine 会写入 agent_loop_rollout_replica_<rank> 子目录。
+PROFILER_ARGS=(
+    --npu-profile-actor
+    --npu-profile-actor-global-step-start 0
+    --npu-profile-actor-global-step-end 1
+    --npu-profile-actor-ranks 0
+    --npu-profile-actor-level level1
+    --npu-profile-actor-export-type db
+    --npu-profile-actor-contents npu cpu
+    --npu-profile-actor-analysis false
+    --npu-profile-actor-save-path "${PROFILE_ROOT}/actor"
+
+    --npu-profile-rollout
+    --npu-profile-rollout-global-step-start 0
+    --npu-profile-rollout-global-step-end 1
+    --npu-profile-rollout-ranks 0
+    --npu-profile-rollout-token-start 10
+    --npu-profile-rollout-token-end 110
+    --npu-profile-rollout-contents npu
+    --npu-profile-rollout-save-path "${PROFILE_ROOT}/rollout"
+)
+
 TRAIN_ARGS=(
     "${MODEL_ARGS[@]}"
     "${CKPT_ARGS[@]}"
@@ -175,11 +216,12 @@ TRAIN_ARGS=(
     "${PERF_ARGS[@]}"
     "${SGLANG_ARGS[@]}"
     "${MISC_ARGS[@]}"
+    "${PROFILER_ARGS[@]}"
 )
 
 if [[ "${PARSE_ONLY:-0}" == 1 ]]; then
     cd "${PROJECT_ROOT}"
-    python -c 'import sys; from slime.utils.arguments import parse_args; args = parse_args(); print("validated", args.num_layers, args.expert_model_parallel_size, args.sglang_device)' "${TRAIN_ARGS[@]}"
+    python -c 'from slime.utils.arguments import parse_args; args = parse_args(); print("validated", args.num_layers, args.expert_model_parallel_size, args.sglang_device, args.npu_profile_actor, args.npu_profile_rollout)' "${TRAIN_ARGS[@]}"
     exit 0
 fi
 
@@ -197,7 +239,7 @@ if [[ "${ALLOW_BUSY_NPUS:-0}" != 1 ]] && \
     exit 2
 fi
 
-mkdir -p "${SAVE_PATH}"
+mkdir -p "${SAVE_PATH}" "${PROFILE_ROOT}/actor" "${PROFILE_ROOT}/rollout"
 cd "${PROJECT_ROOT}"
 if [[ "${RESET_RAY:-0}" == 1 ]]; then
     ray stop --force >/dev/null 2>&1 || true

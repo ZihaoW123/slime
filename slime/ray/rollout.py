@@ -7,8 +7,11 @@ import ray
 import torch
 
 from slime.backends.sglang_utils.deployment import start_rollout_servers
+from slime.backends.sglang_utils.sglang_engine import get_rollout_profile_save_path
 from slime.observability import logging_utils
 from slime.observability.logging_utils import configure_logger, init_tracking
+from slime.observability.npu_profiler import NPUProfilerContents
+from slime.observability.profile_utils import get_profiled_rollout_step
 from slime.observability.rollout_data_utils import (
     load_debug_rollout_data,
     save_debug_rollout_data,
@@ -32,6 +35,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+# SGLang calls the device activity "GPU" in its HTTP API. On Ascend, its
+# profiler backend maps that activity to torch_npu's NPU activity.
+_SGLANG_PROFILE_ACTIVITY_MAP = {"npu": "GPU", "cpu": "CPU"}
 
 
 @ray.remote
@@ -167,7 +174,11 @@ class RolloutManager:
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
-        data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        try:
+            self.start_profile(rollout_id)
+            data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        finally:
+            self.stop_profile(rollout_id)
         save_debug_rollout_data(
             self.args.save_debug_rollout_data,
             data,
@@ -180,6 +191,98 @@ class RolloutManager:
             return
         data = self._convert_samples_to_train_data(data)
         return self._split_train_data_by_dp(data)
+
+    def _get_profiled_rollout_step(self, rollout_id: int) -> int | None:
+        if not self.args.npu_profile_rollout:
+            return None
+        return get_profiled_rollout_step(
+            self.args,
+            rollout_id,
+            self.args.npu_profile_rollout_global_step_start,
+            self.args.npu_profile_rollout_global_step_end,
+        )
+
+    def _build_rollout_profile_request(self) -> dict[str, object | None]:
+        token_start = self.args.npu_profile_rollout_token_start
+        token_end = self.args.npu_profile_rollout_token_end
+        contents = self.args.npu_profile_rollout_contents
+        request: dict[str, object | None] = {
+            "output_dir": get_rollout_profile_save_path(self.args),
+            "start_step": token_start,
+            "num_steps": token_end - token_start if token_end is not None else None,
+            "activities": None,
+            "with_stack": None,
+            "record_shapes": None,
+        }
+        if contents is None:
+            return request
+
+        parsed = NPUProfilerContents.from_contents(contents)
+        if parsed.with_memory:
+            logger.warning(
+                "SGLang rollout profiling does not expose memory profiling; ignoring 'memory' content."
+            )
+        activities = [
+            _SGLANG_PROFILE_ACTIVITY_MAP[name]
+            for name in ("npu", "cpu")
+            if parsed.has(name)
+        ]
+        if activities:
+            request["activities"] = activities
+        # SGLang has no separate with_modules option; match PR 111 and map it
+        # to stack collection.
+        request["with_stack"] = parsed.with_stack or parsed.with_modules
+        request["record_shapes"] = parsed.record_shapes
+        return request
+
+    def _rollout_profile_stops_automatically(self) -> bool:
+        return self._build_rollout_profile_request()["num_steps"] is not None
+
+    def _iter_profile_target_engines(self):
+        allowed_ranks = self.args.npu_profile_rollout_ranks
+        for server in self.servers.values():
+            for group in server.server_groups:
+                for index, engine in enumerate(group.all_engines):
+                    if engine is None or index % group.nodes_per_engine != 0:
+                        continue
+                    rank = group.rank_offset + index
+                    if allowed_ranks is not None and -1 not in allowed_ranks and rank not in allowed_ranks:
+                        continue
+                    yield rank, engine
+
+    def _profile_engines(self, remote_call_getter) -> None:
+        handles = [
+            remote_call_getter(rank, engine)
+            for rank, engine in self._iter_profile_target_engines()
+        ]
+        if handles:
+            ray.get(handles)
+
+    def start_profile(self, rollout_id: int) -> None:
+        """Start profiling selected SGLang engines for one rollout."""
+
+        step = self._get_profiled_rollout_step(rollout_id)
+        if step is None:
+            return
+        logger.info("Starting rollout-side NPU profiling at global step %s (rollout_id=%s).", step, rollout_id)
+        request = self._build_rollout_profile_request()
+        self._profile_engines(lambda _rank, engine: engine.start_profile.remote(**request))
+
+    def stop_profile(self, rollout_id: int) -> None:
+        """Stop selected SGLang profilers unless their token window auto-stops."""
+
+        step = self._get_profiled_rollout_step(rollout_id)
+        if step is None:
+            return
+        if self._rollout_profile_stops_automatically():
+            logger.info(
+                "Rollout profiler auto-stops after num_steps at global step %s (rollout_id=%s).",
+                step,
+                rollout_id,
+            )
+            return
+        logger.info("Stopping rollout-side NPU profiling at global step %s (rollout_id=%s).", step, rollout_id)
+        self._profile_engines(lambda _rank, engine: engine.stop_profile.remote())
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:

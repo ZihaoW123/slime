@@ -5,17 +5,31 @@ from pathlib import Path
 
 import torch
 
+from slime.observability.metric_utils import compute_rollout_step
+from slime.observability.npu_profiler import NPUProfilerConfig, NPUProfilerManager
 from slime.utils import accelerator
 from slime.utils.memory_utils import print_memory
 
 logger = logging.getLogger(__name__)
 
 
+def is_step_in_profile_window(step: int, step_start: int, step_end: int) -> bool:
+    return step >= step_start and (step_end == -1 or step < step_end)
+
+
+def get_profiled_rollout_step(args, rollout_id: int, step_start: int, step_end: int) -> int | None:
+    step = compute_rollout_step(args, rollout_id)
+    return step if is_step_in_profile_window(step, step_start, step_end) else None
+
+
 class TrainProfiler:
-    def __init__(self, args):
+    def __init__(self, args, role: str = "actor"):
         self.args = args
+        self.role = role
         self._torch_profiler_overall = None
         self._memory_profiler_overall = None
+        self._npu_profiler = None
+        self._actor_npu_profile_active = False
 
         if args.use_pytorch_profiler:
             self._torch_profiler_overall = _create_torch_profiler(args, name="train_overall")
@@ -24,9 +38,33 @@ class TrainProfiler:
             self._memory_profiler_overall = _BaseMemoryProfiler.create(args)
             self._memory_profiler_overall.start()
 
+        if role == "actor" and getattr(args, "npu_profile_actor", False):
+            self._npu_profiler = NPUProfilerManager(_create_npu_profiler_config(args))
+
     def on_init_end(self):
         if self._torch_profiler_overall is not None:
             self._torch_profiler_overall.start()
+
+    def _should_profile_actor_step(self, rollout_id: int) -> bool:
+        if self._npu_profiler is None:
+            return False
+        return (
+            get_profiled_rollout_step(
+                self.args,
+                rollout_id,
+                self.args.npu_profile_actor_global_step_start,
+                self.args.npu_profile_actor_global_step_end,
+            )
+            is not None
+        )
+
+    def start_actor_profile(self, rollout_id: int) -> None:
+        if not self._should_profile_actor_step(rollout_id) or self._actor_npu_profile_active:
+            return
+        step = compute_rollout_step(self.args, rollout_id)
+        logger.info("Starting actor-side NPU profiling at global step %s (rollout_id=%s).", step, rollout_id)
+        self._npu_profiler.start()
+        self._actor_npu_profile_active = True
 
     def step(self, rollout_id: int):
         if self._torch_profiler_overall is not None:
@@ -38,6 +76,35 @@ class TrainProfiler:
             and (rollout_id == s - 1)
         ):
             self._memory_profiler_overall.stop()
+
+        if self._actor_npu_profile_active:
+            self._npu_profiler.step()
+            has_next_rollout = self.args.num_rollout is not None and rollout_id + 1 < self.args.num_rollout
+            should_continue = has_next_rollout and self._should_profile_actor_step(rollout_id + 1)
+            if not should_continue:
+                step = compute_rollout_step(self.args, rollout_id)
+                self._npu_profiler.stop()
+                self._actor_npu_profile_active = False
+                logger.info("Stopping actor-side NPU profiling at global step %s (rollout_id=%s).", step, rollout_id)
+
+
+def _create_npu_profiler_config(args) -> NPUProfilerConfig:
+    current_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    global_step_start = args.npu_profile_actor_global_step_start
+    global_step_end = args.npu_profile_actor_global_step_end
+    local_step_end = -1 if global_step_end == -1 else global_step_end - global_step_start
+    return NPUProfilerConfig(
+        enabled=True,
+        step_start=0,
+        step_end=local_step_end,
+        ranks=args.npu_profile_actor_ranks,
+        level=args.npu_profile_actor_level,
+        export_type=args.npu_profile_actor_export_type,
+        contents=args.npu_profile_actor_contents,
+        analysis=args.npu_profile_actor_analysis,
+        save_path=args.npu_profile_actor_save_path,
+        current_rank=current_rank,
+    )
 
 
 def _create_torch_profiler(args, name):

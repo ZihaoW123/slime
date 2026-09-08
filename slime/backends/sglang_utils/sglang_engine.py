@@ -4,6 +4,7 @@ import logging
 import multiprocessing
 import os
 import time
+from pathlib import Path
 
 import requests
 from sglang.srt.server_args import ServerArgs
@@ -16,6 +17,18 @@ from slime.utils import accelerator
 from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
+
+
+def get_rollout_profile_save_path(args, rank: int | None = None) -> str:
+    """Return the rollout profile directory, optionally scoped to one engine."""
+
+    save_path = getattr(args, "npu_profile_rollout_save_path", None)
+    base_path = save_path or str(
+        Path(getattr(args, "npu_profile_actor_save_path", "./npu_profile")) / "rollout"
+    )
+    if rank is None:
+        return base_path
+    return str(Path(base_path) / f"agent_loop_rollout_replica_{rank}")
 
 
 def _enable_memory_saver(args) -> bool:
@@ -484,6 +497,11 @@ class SGLangEngine(RayActor):
     ):
         if self.node_rank != 0:
             return
+        if output_dir is not None:
+            output_dir = get_rollout_profile_save_path(self.args, rank=self.rank)
+            # torch_npu's trace handler falls back to a default directory when
+            # its requested path does not exist when profiling begins.
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
         response = requests.post(
             f"http://{self.server_host}:{self.server_port}/start_profile",
             json={

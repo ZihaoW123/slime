@@ -11,9 +11,62 @@ from slime.backends.sglang_utils.arguments import sglang_parse_args
 from slime.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from slime.backends.sglang_utils.external import apply_external_engine_info_to_args
 from slime.observability.logging_utils import configure_logger
+from slime.observability.npu_profiler import SUPPORTED_NPU_PROFILER_CONTENTS
 from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 
 logger = logging.getLogger(__name__)
+
+NPU_PROFILER_CONTENT_CHOICES = sorted(SUPPORTED_NPU_PROFILER_CONTENTS)
+
+
+def _parse_bool_arg(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "y", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}")
+
+
+def _validate_non_negative_step_window(args, start_attr: str, end_attr: str) -> None:
+    start = getattr(args, start_attr, None)
+    end = getattr(args, end_attr, None)
+    if start is not None:
+        assert start >= 0, f"{start_attr} must be >= 0, got {start}"
+    if end is not None and end != -1:
+        assert end >= 0, f"{end_attr} must be >= 0 or -1, got {end}"
+    if start is not None and end is not None and end != -1:
+        assert end > start, f"{end_attr} must be > {start_attr}, got start={start}, end={end}"
+
+
+def _validate_required_non_negative_range(
+    start_name: str,
+    start: int | None,
+    end_name: str,
+    end: int | None,
+) -> None:
+    if start is None and end is None:
+        return
+    for name, value in ((start_name, start), (end_name, end)):
+        if value is not None:
+            assert value >= 0, f"{name} must be >= 0, got {value}"
+    assert start is not None, f"{start_name} must be set when {end_name} is provided."
+    assert end is not None, f"{end_name} must be set when {start_name} is provided."
+    assert end > start, f"{end_name} must be > {start_name}, got start={start}, end={end}"
+
+
+def _validate_optional_profile_ranks(args, attr_name: str) -> None:
+    ranks = getattr(args, attr_name, None)
+    if ranks is None:
+        return
+    assert isinstance(ranks, list), f"{attr_name} must be a list[int], got {type(ranks)}"
+    assert ranks, f"{attr_name} must not be empty when provided."
+    if -1 in ranks:
+        assert len(ranks) == 1, f"{attr_name} cannot mix -1 with explicit ranks, got {ranks}"
+        return
+    assert all(rank >= 0 for rank in ranks), (
+        f"{attr_name} must contain only -1 or non-negative ranks, got {ranks}"
+    )
 
 
 def reset_arg(parser, name, **kwargs):
@@ -1315,6 +1368,117 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
             )
+            # torch_npu.profiler is controlled independently for the training
+            # actors and the SGLang rollout server processes.
+            parser.add_argument(
+                "--npu-profile-actor",
+                action="store_true",
+                default=False,
+                help="Collect torch_npu.profiler data in actor (training) processes.",
+            )
+            parser.add_argument(
+                "--npu-profile-actor-global-step-start",
+                type=int,
+                default=0,
+                help="First global rollout step profiled on the actor side (inclusive).",
+            )
+            parser.add_argument(
+                "--npu-profile-actor-global-step-end",
+                type=int,
+                default=-1,
+                help="Actor profile window end (exclusive); -1 profiles until training ends.",
+            )
+            parser.add_argument(
+                "--npu-profile-actor-ranks",
+                type=int,
+                nargs="+",
+                default=None,
+                help="Training global ranks to profile; omit or use -1 for every rank.",
+            )
+            parser.add_argument(
+                "--npu-profile-actor-level",
+                choices=["level_none", "level0", "level1", "level2"],
+                default="level1",
+                help="torch_npu profiler detail level for actor processes.",
+            )
+            parser.add_argument(
+                "--npu-profile-actor-export-type",
+                choices=["text", "db"],
+                default="db",
+                help="Actor trace export type.",
+            )
+            parser.add_argument(
+                "--npu-profile-actor-contents",
+                nargs="+",
+                choices=NPU_PROFILER_CONTENT_CHOICES,
+                default=None,
+                help="Actor trace contents: npu cpu memory shapes module stack.",
+            )
+            parser.add_argument(
+                "--npu-profile-actor-analysis",
+                type=_parse_bool_arg,
+                default=False,
+                help="Run torch_npu profiler analysis after actor trace collection.",
+            )
+            parser.add_argument(
+                "--npu-profile-actor-save-path",
+                type=str,
+                default="./npu_profile",
+                help="Directory for actor-side NPU profile output.",
+            )
+            parser.add_argument(
+                "--npu-profile-rollout",
+                action="store_true",
+                default=False,
+                help="Collect NPU profile data in SGLang rollout server processes.",
+            )
+            parser.add_argument(
+                "--npu-profile-rollout-global-step-start",
+                type=int,
+                default=0,
+                help="First global rollout step profiled on the rollout side (inclusive).",
+            )
+            parser.add_argument(
+                "--npu-profile-rollout-global-step-end",
+                type=int,
+                default=-1,
+                help="Rollout profile window end (exclusive); -1 profiles until training ends.",
+            )
+            parser.add_argument(
+                "--npu-profile-rollout-ranks",
+                type=int,
+                nargs="+",
+                default=None,
+                help="SGLang engine leader ranks to profile; omit or use -1 for every engine.",
+            )
+            parser.add_argument(
+                "--npu-profile-rollout-save-path",
+                type=str,
+                default=None,
+                help="Rollout profile directory; defaults to <actor-save-path>/rollout.",
+            )
+            parser.add_argument(
+                "--npu-profile-rollout-token-start",
+                type=int,
+                default=None,
+                help="SGLang profiler token/forward-step start index (inclusive).",
+            )
+            parser.add_argument(
+                "--npu-profile-rollout-token-end",
+                type=int,
+                default=None,
+                help="SGLang profiler token/forward-step end index (exclusive).",
+            )
+            parser.add_argument(
+                "--npu-profile-rollout-contents",
+                nargs="+",
+                choices=NPU_PROFILER_CONTENT_CHOICES,
+                default=None,
+                help=(
+                    "Rollout trace contents: npu cpu memory shapes module stack. "
+                    "SGLang ignores memory and maps module to stack."
+                ),
+            )
             parser.add_argument(
                 "--memory-recorder",
                 type=str,
@@ -1770,6 +1934,25 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def slime_validate_args(args):
     args.eval_datasets = _resolve_eval_datasets(args)
+
+    _validate_non_negative_step_window(
+        args,
+        "npu_profile_actor_global_step_start",
+        "npu_profile_actor_global_step_end",
+    )
+    _validate_optional_profile_ranks(args, "npu_profile_actor_ranks")
+    _validate_non_negative_step_window(
+        args,
+        "npu_profile_rollout_global_step_start",
+        "npu_profile_rollout_global_step_end",
+    )
+    _validate_optional_profile_ranks(args, "npu_profile_rollout_ranks")
+    _validate_required_non_negative_range(
+        "npu_profile_rollout_token_start",
+        args.npu_profile_rollout_token_start,
+        "npu_profile_rollout_token_end",
+        args.npu_profile_rollout_token_end,
+    )
 
     if args.rollout_temperature <= 0:
         raise ValueError(
