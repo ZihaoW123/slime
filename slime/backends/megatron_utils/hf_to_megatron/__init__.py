@@ -4,7 +4,7 @@ from transformers import AutoConfig
 
 from .common import load_model_hf_weights
 from .deepseek import deepseek_hf_tensor
-from .glm import glm4_hf_tensor, glm4_moe_hf_tensor
+from .glm import glm4_hf_tensor, glm4_moe_hf_tensor, glm5_next_hf_tensor
 from .qwen import mimo_hf_tensor, minimax_m2_hf_tensor, qwen_hf_tensor, qwen_moe_hf_tensor
 from .qwen3_5 import qwen3_5_hf_tensor
 from .qwen3_next import qwen3_next_hf_tensor
@@ -15,6 +15,7 @@ _LOADERS = {
     "glm4": glm4_hf_tensor,
     "glm4_moe": glm4_moe_hf_tensor,
     "glm4_moe_lite": deepseek_hf_tensor,
+    "glm5_next": glm5_next_hf_tensor,
     "glm_moe_dsa": deepseek_hf_tensor,
     "kimi_k2": deepseek_hf_tensor,
     "llama": qwen_hf_tensor,

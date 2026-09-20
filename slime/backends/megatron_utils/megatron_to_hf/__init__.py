@@ -14,6 +14,14 @@ from .qwen3moe import convert_qwen3moe_to_hf
 
 # TODO optimize code details
 def convert_to_hf(args, model_name, name, param, quantization_config=None, transform_ue8m0=True):
+    if "glm5next" in model_name.lower().replace("_", "").replace("-", ""):
+        from slime_plugins.models.glm5_next.contract import hf_weight_name
+        from slime_plugins.models.glm5_next.weight_mapping import export_hf_tensor
+
+        if quantization_config is not None:
+            raise ValueError("GLM-5.3 HF actor weight sync requires a BF16 checkpoint")
+        return export_hf_tensor(hf_weight_name(name), param)
+
     hf_name = name
     while hf_name.startswith("module."):
         hf_name = hf_name.removeprefix("module.")

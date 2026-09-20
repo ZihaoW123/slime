@@ -85,3 +85,11 @@ def glm4_moe_hf_tensor(name: str, reader: SafetensorReader, config) -> torch.Ten
         raise KeyError(f"Unsupported GLM-4 MoE Megatron parameter {name!r}")
     layer, rest = match.groups()
     return _glm4_moe_layer_tensor(rest, f"model.layers.{layer}", reader, config)
+
+
+def glm5_next_hf_tensor(name: str, reader: SafetensorReader, config) -> torch.Tensor:
+    """Load released GLM-5.3 tensors into Megatron's hybrid actor layout."""
+    from slime_plugins.models.glm5_next.contract import hf_weight_name
+    from slime_plugins.models.glm5_next.weight_mapping import load_hf_tensor
+
+    return load_hf_tensor(hf_weight_name(name), reader, config)

@@ -17,6 +17,7 @@ from slime.utils.types import ParamInfo
 
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import FlattenedTensorBucket, MultiprocessingSerializer
+from ..tms_utils import empty_cache_unless_npu_tms_pool_active
 from .expert_routing import configure_expert_routing
 from .hf_weight_iterator_direct import HfWeightIteratorDirect
 from .update_weight_from_distributed import (
@@ -270,9 +271,9 @@ class UpdateWeightFromTensor:
                 accelerator.synchronize()
                 del refs, long_lived_tensors, hf_named_tensors
                 accelerator.ipc_collect()
-                accelerator.empty_cache()
+                empty_cache_unless_npu_tms_pool_active()
         del staging_buffers
-        accelerator.empty_cache()
+        empty_cache_unless_npu_tms_pool_active()
 
     @torch.no_grad()
     def update_weights(self) -> None:
@@ -308,7 +309,7 @@ class UpdateWeightFromTensor:
             # have already closed their IPC handles.
             del refs, long_lived_tensors, hf_named_tensors
             accelerator.ipc_collect()
-            accelerator.empty_cache()
+            empty_cache_unless_npu_tms_pool_active()
 
         if self._expert_transfer_plan:
             self._update_expert_weights(megatron_local_weights)
@@ -318,7 +319,7 @@ class UpdateWeightFromTensor:
         # After the barrier all engines have returned, so every rank's last-chunk
         # IPC handles are now released by the consumers.  Clean them up.
         accelerator.ipc_collect()
-        accelerator.empty_cache()
+        empty_cache_unless_npu_tms_pool_active()
 
         # int4/fp4 post_process
         if self.rank == 0:

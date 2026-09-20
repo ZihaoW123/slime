@@ -45,6 +45,7 @@ from .loss import (
     get_values,
 )
 from .model import forward_only, initialize_model_and_optimizer, save, train
+from .tms_utils import allow_tms_initial_region_subregions
 from .update_weight import create_weight_updater
 from .update_weight.common import named_params_and_buffers
 
@@ -91,9 +92,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
         dist.barrier(group=get_gloo_group())
 
-        self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
-            args, role
-        )
+        with allow_tms_initial_region_subregions(args.offload_train):
+            self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = (
+                initialize_model_and_optimizer(args, role)
+            )
 
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
         if vpp_size > 1:
