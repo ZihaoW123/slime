@@ -10,6 +10,7 @@ import torch.multiprocessing as mp
 from slime_plugins.models.glm5_next.contract import hf_weight_name, packed_intervals
 from slime_plugins.models.glm5_next.parallel_model import (
     Glm5NextLocalExperts,
+    forward_packed_moe_layer,
     gather_cp_sequence,
     validate_parallelism,
 )
@@ -164,6 +165,46 @@ def test_expert_checkpoint_replica_ids_use_expert_data_parallel_rank():
     assert use_expert_data_parallel_replica_ids(state, expert_dp_rank=2) is state
     assert expert.replica_id == (0, 0, 2)
     assert shared.replica_id == (0, 0, 7)
+
+
+def test_packed_moe_layer_dispatches_once_for_different_length_sequences():
+    class IdentityHyperConnection(torch.nn.Module):
+        def forward(self, hidden):
+            batch, sequence, streams, _ = hidden.shape
+            post = torch.ones((batch, sequence, streams), dtype=hidden.dtype)
+            comb = torch.eye(streams, dtype=hidden.dtype).expand(batch, sequence, -1, -1)
+            return post, comb, hidden.mean(dim=2)
+
+    class Attention(torch.nn.Module):
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states + 1, None, torch.zeros(
+                (*hidden_states.shape[:2], 1), dtype=torch.int32
+            )
+
+    class CountingMoe(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        def forward(self, hidden):
+            self.calls.append(hidden.shape)
+            return hidden * 2
+
+    layer = SimpleNamespace(
+        block_type="deepseek_sparse_attention",
+        attn_hc=IdentityHyperConnection(),
+        input_layernorm=torch.nn.Identity(),
+        self_attn=Attention(),
+        ffn_hc=IdentityHyperConnection(),
+        post_attention_layernorm=torch.nn.Identity(),
+        mlp=CountingMoe(),
+    )
+    sequences = [torch.ones(1, 2, 2, 4), torch.ones(1, 3, 2, 4)]
+    outputs, topk = forward_packed_moe_layer(layer, sequences, [None, None])
+
+    assert layer.mlp.calls == [torch.Size([1, 5, 4])]
+    assert [output.shape for output in outputs] == [torch.Size([1, 2, 2, 4]), torch.Size([1, 3, 2, 4])]
+    assert all(indices is not None for indices in topk)
 
 
 def _cp_worker(rank: int, rendezvous: str):

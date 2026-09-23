@@ -213,6 +213,78 @@ class Glm5NextMegatronMoE(nn.Module):
         return routed.transpose(0, 1).contiguous() + self.shared_experts(hidden_states)
 
 
+def forward_packed_moe_layer(layer, sequences, previous_topk_indices):
+    """Run attention per packed sequence and dispatch all tokens through MoE once.
+
+    Dynamic batching can assign a different number of packed sequences to each
+    EP rank.  Calling the complete decoder layer once per sequence would then
+    issue a different number of MoE collectives on each rank and deadlock the
+    expert all-to-all.  Attention must stay sequence-local, while the token
+    dispatcher must see one concatenated tensor per layer and rank.
+    """
+    if len(sequences) != len(previous_topk_indices):
+        raise ValueError("Packed hidden states and top-k state must have the same length")
+
+    ffn_inputs = []
+    residuals = []
+    ffn_posts = []
+    ffn_combs = []
+    next_topk_indices = []
+    lengths = []
+
+    for hidden_states, previous in zip(sequences, previous_topk_indices, strict=True):
+        dtype = hidden_states.dtype
+        length = hidden_states.shape[1]
+        positions = torch.arange(length, device=hidden_states.device).unsqueeze(0)
+        valid = torch.ones(1, length, device=hidden_states.device, dtype=torch.bool)
+
+        residual = hidden_states
+        post, comb, attention_input = layer.attn_hc(hidden_states)
+        attention_input = layer.input_layernorm(attention_input)
+        if layer.block_type == "linear_attention":
+            attention_output = layer.self_attn(
+                hidden_states=attention_input,
+                cache_params=None,
+                attention_mask=valid,
+            )
+            topk_indices = None
+        else:
+            attention_output, _, topk_indices = layer.self_attn(
+                hidden_states=attention_input,
+                attention_mask=valid,
+                position_ids=positions,
+                past_key_values=None,
+                use_cache=False,
+                position_embeddings=None,
+                prev_topk_indices=previous,
+            )
+        hidden_states = post.to(dtype).unsqueeze(-1) * attention_output.unsqueeze(-2) + torch.matmul(
+            comb.to(dtype).transpose(-1, -2), residual
+        )
+
+        residual = hidden_states
+        post, comb, ffn_input = layer.ffn_hc(hidden_states)
+        ffn_inputs.append(layer.post_attention_layernorm(ffn_input))
+        residuals.append(residual)
+        ffn_posts.append(post)
+        ffn_combs.append(comb)
+        next_topk_indices.append(topk_indices)
+        lengths.append(length)
+
+    packed_ffn_output = layer.mlp(torch.cat(ffn_inputs, dim=1))
+    sequence_ffn_outputs = packed_ffn_output.split(lengths, dim=1)
+    outputs = []
+    for ffn_output, residual, post, comb in zip(
+        sequence_ffn_outputs, residuals, ffn_posts, ffn_combs, strict=True
+    ):
+        dtype = residual.dtype
+        outputs.append(
+            post.to(dtype).unsqueeze(-1) * ffn_output.unsqueeze(-2)
+            + torch.matmul(comb.to(dtype).transpose(-1, -2), residual)
+        )
+    return outputs, next_topk_indices
+
+
 class Glm5NextMegatronModel(nn.Module):
     """One PP stage; pipeline payload is the flattened four-stream mHC state."""
 
@@ -300,15 +372,26 @@ class Glm5NextMegatronModel(nn.Module):
             full = full.view(1, -1, self.hc_mult, self.hidden_size)
 
         intervals = packed_intervals(packed_seq_params.cu_seqlens_q, full.shape[1])
-        sequence_outputs = []
-        for start, end in intervals:
-            hidden = full[:, start:end]
-            positions = torch.arange(end - start, device=hidden.device).unsqueeze(0)
-            valid = torch.ones(1, end - start, device=hidden.device, dtype=torch.bool)
-            topk_indices = None
-            for layer in language_model.layers.values():
+        sequence_outputs = [full[:, start:end] for start, end in intervals]
+        topk_indices = [None] * len(sequence_outputs)
+        for layer in language_model.layers.values():
+            if isinstance(layer.mlp, Glm5NextMegatronMoE):
+                # Keep one MoE collective per layer on every EP rank.  The
+                # sparse layer is intentionally not activation-checkpointed:
+                # replaying expert collectives during backward is unsafe.
+                sequence_outputs, topk_indices = forward_packed_moe_layer(
+                    layer, sequence_outputs, topk_indices
+                )
+                continue
 
-                def layer_forward(x, block=layer, previous=topk_indices, mask=valid, pos=positions):
+            next_outputs = []
+            next_topk_indices = []
+            for hidden, previous in zip(sequence_outputs, topk_indices, strict=True):
+                length = hidden.shape[1]
+                positions = torch.arange(length, device=hidden.device).unsqueeze(0)
+                valid = torch.ones(1, length, device=hidden.device, dtype=torch.bool)
+
+                def layer_forward(x, block=layer, previous=previous, mask=valid, pos=positions):
                     return block(
                         x,
                         attention_mask=mask,
@@ -318,10 +401,13 @@ class Glm5NextMegatronModel(nn.Module):
                     )
 
                 if self.recompute and self.training:
-                    hidden, topk_indices = checkpoint(layer_forward, hidden, use_reentrant=False)
+                    hidden, current_topk = checkpoint(layer_forward, hidden, use_reentrant=False)
                 else:
-                    hidden, topk_indices = layer_forward(hidden)
-            sequence_outputs.append(hidden)
+                    hidden, current_topk = layer_forward(hidden)
+                next_outputs.append(hidden)
+                next_topk_indices.append(current_topk)
+            sequence_outputs = next_outputs
+            topk_indices = next_topk_indices
         full = torch.cat(sequence_outputs, dim=1)
         local = full[:, cp_rank * local_length : (cp_rank + 1) * local_length]
         if not self.post_process:
