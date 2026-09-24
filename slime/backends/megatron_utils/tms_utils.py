@@ -3,6 +3,7 @@ from contextlib import contextmanager
 
 
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+_NPU_TMS_TEMPORARY_POOL_DEPTH = 0
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -37,6 +38,53 @@ def empty_cache_unless_npu_tms_pool_active() -> bool:
 
     accelerator.empty_cache()
     return True
+
+
+@contextmanager
+def npu_tms_temporary_allocation_pool(enabled: bool):
+    """Keep ephemeral train allocations out of the persistent TMS region.
+
+    Preload mode must remain active while Megatron constructs model, parameter,
+    and gradient buffers so they can be paused for colocated rollout. During a
+    train step, however, autograd and HCCL request temporary caching-allocator
+    segments. Tracking those segments as persistent NPU virtual-memory regions
+    can turn a small request into a multi-gigabyte physical allocation.
+
+    ``torch_memory_saver.disable()`` provides an isolated NPU memory pool and
+    disposes it after the step. Existing tracked model allocations are not
+    affected and remain available to ``pause()``/``resume()``.
+    """
+
+    if not enabled or not _env_flag("TMS_INIT_ENABLE"):
+        yield
+        return
+
+    from slime.utils import accelerator
+
+    if accelerator.device_type() != "npu":
+        yield
+        return
+
+    from torch_memory_saver import torch_memory_saver
+
+    global _NPU_TMS_TEMPORARY_POOL_DEPTH
+    _NPU_TMS_TEMPORARY_POOL_DEPTH += 1
+    try:
+        with torch_memory_saver.disable():
+            yield
+    finally:
+        _NPU_TMS_TEMPORARY_POOL_DEPTH -= 1
+
+
+def npu_tms_temporary_allocation_pool_active() -> bool:
+    """Return whether this actor process is inside the disposable NPU pool.
+
+    This is process-scoped rather than a ``ContextVar`` because PyTorch's
+    autograd engine can invoke Python backward callbacks from another execution
+    context in the same actor process.
+    """
+
+    return _NPU_TMS_TEMPORARY_POOL_DEPTH > 0
 
 
 @contextmanager

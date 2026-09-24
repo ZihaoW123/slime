@@ -12,9 +12,11 @@ from slime_plugins.models.glm5_next.contract import hf_weight_name, packed_inter
 from slime_plugins.models.glm5_next.parallel_model import (
     Glm5NextLocalExperts,
     Glm5NextMegatronModel,
+    _causal_kda_decay_mask,
     forward_packed_moe_layer,
     gather_cp_sequence,
     make_pipeline_payload,
+    stable_chunk_kimi_delta_attention,
     validate_parallelism,
 )
 from slime_plugins.models.glm5_next.weight_mapping import checkpoint_name, export_hf_tensor
@@ -106,6 +108,30 @@ def test_validation_reward_produces_nonzero_advantages_per_group():
     samples = [SimpleNamespace(index=index) for index in range(8)]
     rewards = asyncio.run(alternating_group_reward(None, samples))
     assert rewards == [0.0, 1.0] * 4
+
+
+def test_kda_decay_masks_future_exponents_before_exp():
+    g = torch.full((1, 1, 1, 64, 1), -5.0).cumsum(dim=-2)
+
+    decay = _causal_kda_decay_mask(g, chunk_size=64)
+
+    assert torch.isfinite(decay).all()
+    assert decay[0, 0, 0, 0, 63, 0] == 1
+    torch.testing.assert_close(decay[0, 0, 0, 63, 0, 0], torch.exp(torch.tensor(-315.0)))
+
+
+def test_stable_eager_kda_backward_is_finite_for_strong_decay():
+    query = torch.randn(1, 64, 1, 2, requires_grad=True)
+    key = torch.randn(1, 64, 1, 2, requires_grad=True)
+    value = torch.randn(1, 64, 1, 2, requires_grad=True)
+    g = torch.full((1, 64, 1, 2), -5.0, requires_grad=True)
+    beta = torch.sigmoid(torch.randn(1, 64, 1, requires_grad=True))
+
+    output, _ = stable_chunk_kimi_delta_attention(query, key, value, g, beta, chunk_size=64)
+    output.square().mean().backward()
+
+    assert torch.isfinite(output).all()
+    assert all(torch.isfinite(tensor.grad).all() for tensor in (query, key, value, g))
 
 
 def test_router_layout_must_match_published_weights():

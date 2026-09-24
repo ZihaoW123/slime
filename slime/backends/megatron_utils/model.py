@@ -36,6 +36,7 @@ from .data import DataIterator, get_batch
 from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
 from .model_provider import get_model_provider_func
 from .stateless_adam import StatelessAdam
+from .tms_utils import npu_tms_temporary_allocation_pool
 
 logger = logging.getLogger(__name__)
 
@@ -645,45 +646,55 @@ def train_one_step(
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
-    losses_reduced = forward_backward_func(
-        forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
-        data_iterator=data_iterator,
-        model=model,
-        num_microbatches=num_microbatches,
-        seq_length=args.seq_length,
-        micro_batch_size=args.micro_batch_size,
-        decoder_seq_length=args.decoder_seq_length,
-        forward_only=False,
+    # A disposable NPU pool prevents temporary autograd allocations from being
+    # captured by TMS preload mode. End it before grad-norm collectives so the
+    # multi-gigabyte forward/backward cache is returned to HBM first.
+    anomaly_context = (
+        torch.autograd.detect_anomaly(check_nan=True)
+        if os.getenv("SLIME_DETECT_AUTOGRAD_ANOMALY", "0") == "1"
+        else nullcontext()
     )
+    with npu_tms_temporary_allocation_pool(args.offload_train), anomaly_context:
+        losses_reduced = forward_backward_func(
+            forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
+            data_iterator=data_iterator,
+            model=model,
+            num_microbatches=num_microbatches,
+            seq_length=args.seq_length,
+            micro_batch_size=args.micro_batch_size,
+            decoder_seq_length=args.decoder_seq_length,
+            forward_only=False,
+        )
 
-    valid_step = True
-    grad_norm = float("nan")
-    if not getattr(args, "check_for_nan_in_loss_and_grad", True):
-        found_inf_flag = optimizer.prepare_grads()
-        if found_inf_flag:
-            valid_step = False
-        else:
-            grad_norm = optimizer.get_grad_norm()
-            if isinstance(grad_norm, torch.Tensor):
-                valid_step = not (torch.isnan(grad_norm) or torch.isinf(grad_norm))
+    with npu_tms_temporary_allocation_pool(args.offload_train):
+        valid_step = True
+        grad_norm = float("nan")
+        if not getattr(args, "check_for_nan_in_loss_and_grad", True):
+            found_inf_flag = optimizer.prepare_grads()
+            if found_inf_flag:
+                valid_step = False
             else:
-                valid_step = not (math.isnan(grad_norm) or math.isinf(grad_norm))
+                grad_norm = optimizer.get_grad_norm()
+                if isinstance(grad_norm, torch.Tensor):
+                    valid_step = not (torch.isnan(grad_norm) or torch.isinf(grad_norm))
+                else:
+                    valid_step = not (math.isnan(grad_norm) or math.isinf(grad_norm))
 
-    # CI check: verify only MTP parameters have non-zero gradients when truncation happens
-    # This check must happen before optimizer.step() as gradients may be modified during step
-    if args.ci_test and args.enable_mtp_training:
-        from slime.backends.megatron_utils.ci_utils import check_mtp_only_grad
+        # CI check: verify only MTP parameters have non-zero gradients when truncation happens
+        # This check must happen before optimizer.step() as gradients may be modified during step
+        if args.ci_test and args.enable_mtp_training:
+            from slime.backends.megatron_utils.ci_utils import check_mtp_only_grad
 
-        check_mtp_only_grad(model, step_id)
+            check_mtp_only_grad(model, step_id)
 
-    if valid_step:
-        # Update parameters.
-        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        if valid_step:
+            # Update parameters.
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
-        # Update learning rate. Use the per-step global_batch_size when dynamic
-        # batching is on so the scheduler's samples-seen counter tracks reality.
-        assert update_successful
-        opt_param_scheduler.step(increment=step_global_batch_size)
+            # Update learning rate. Use the per-step global_batch_size when dynamic
+            # batching is on so the scheduler's samples-seen counter tracks reality.
+            assert update_successful
+            opt_param_scheduler.step(increment=step_global_batch_size)
 
     # release grad
     for model_chunk in model:

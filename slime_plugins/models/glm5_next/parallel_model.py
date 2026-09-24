@@ -20,6 +20,142 @@ from torch.utils.checkpoint import checkpoint
 from .contract import packed_intervals
 
 
+def _causal_kda_decay_mask(g: torch.Tensor, chunk_size: int) -> torch.Tensor:
+    """Exponentiate only finite, causally valid KDA decay exponents.
+
+    The Transformers eager implementation exponentiates the complete pairwise
+    matrix and masks its upper triangle afterwards. Since ``g`` is a cumulative
+    negative decay, invalid future-token entries can overflow to ``inf``. Their
+    forward values are subsequently zeroed, but autograd still encounters
+    ``0 * inf`` in ``MulBackward`` and produces NaN gradients.
+
+    Invalid entries are mathematically unused, so setting their exponent to
+    zero before ``exp`` preserves every causal entry and makes backward finite.
+    """
+    exponent = g.unsqueeze(-2) - g.unsqueeze(-3)
+    future = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=g.device),
+        diagonal=1,
+    )
+    return exponent.masked_fill(future.unsqueeze(-1), 0).exp().float()
+
+
+def stable_chunk_kimi_delta_attention(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    chunk_size=64,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+    **kwargs,
+):
+    """Transformers' eager KDA with causal masking applied before ``exp``."""
+    from transformers.models.glm5_next.modeling_glm5_next import l2norm
+
+    initial_dtype = query.dtype
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+    ]
+    if use_qk_l2norm_in_kernel:
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
+
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    scale = 1 / (query.shape[-1] ** 0.5)
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    total_sequence_length = sequence_length + pad_size
+
+    query = F.pad(query, (0, 0, 0, pad_size)) * scale
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    g = F.pad(g, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+
+    query, key, value, g, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
+        for x in (query, key, value, g, k_beta, v_beta)
+    ]
+    beta = beta.reshape(beta.shape[0], beta.shape[1], -1, chunk_size)
+
+    g = g.cumsum(dim=-2)
+    upper_with_diagonal = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
+    )
+    decay_mask = _causal_kda_decay_mask(g, chunk_size)
+    attn = -(k_beta.unsqueeze(-2) * key.unsqueeze(-3) * decay_mask).sum(dim=-1).masked_fill(
+        upper_with_diagonal, 0
+    )
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    value = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp())
+
+    last_recurrent_state = (
+        torch.zeros(
+            batch_size,
+            num_heads,
+            k_head_dim,
+            v_head_dim,
+            dtype=value.dtype,
+            device=value.device,
+        )
+        if initial_state is None
+        else initial_state.to(value)
+    )
+    core_attn_out = torch.zeros_like(value)
+
+    strict_upper = torch.triu(
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
+    )
+    for i in range(total_sequence_length // chunk_size):
+        q_i = query[:, :, i]
+        k_i = key[:, :, i]
+        v_i = value[:, :, i]
+        g_i = g[:, :, i]
+
+        attn_inter = (q_i * g_i.exp()) @ last_recurrent_state
+        attn_intra = (
+            (q_i.unsqueeze(-2) * k_i.unsqueeze(-3) * decay_mask[:, :, i])
+            .sum(dim=-1)
+            .masked_fill(strict_upper, 0)
+        )
+        v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
+        v_new = v_i - v_prime
+
+        core_attn_out[:, :, i] = attn_inter + attn_intra @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g_i[:, :, -1].exp().unsqueeze(-1)
+            + (k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new
+        )
+
+    if not output_final_state:
+        last_recurrent_state = None
+
+    core_attn_out = core_attn_out.reshape(
+        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
+    )
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    return core_attn_out, last_recurrent_state
+
+
+def install_stable_eager_kda() -> None:
+    """Use the numerically stable eager KDA implementation for training."""
+    from transformers.models.glm5_next import modeling_glm5_next
+
+    modeling_glm5_next.chunk_kimi_delta_attention = stable_chunk_kimi_delta_attention
+
+
 class _GatherSequence(torch.autograd.Function):
     """All-gather contiguous CP shards, summing gradients before scattering."""
 
@@ -448,6 +584,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None):
     from transformers import AutoConfig
 
     args = get_args()
+    install_stable_eager_kda()
     hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True, local_files_only=True)
     validate_parallelism(args, hf_config)
     text_config = hf_config.text_config

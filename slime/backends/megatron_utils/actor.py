@@ -45,6 +45,7 @@ from .loss import (
     get_values,
 )
 from .model import forward_only, initialize_model_and_optimizer, save, train
+from .npu_grad_scaling import install_npu_chunked_grad_scaling
 from .tms_utils import allow_tms_initial_region_subregions
 from .update_weight import create_weight_updater
 from .update_weight.common import named_params_and_buffers
@@ -68,6 +69,7 @@ class MegatronTrainRayActor(TrainRayActor):
             return 0
 
         monkey_patch_torch_dist()
+        install_npu_chunked_grad_scaling()
         super().init(args, role, with_ref, with_opd_teacher)
         # Destroying and recreating WORLD invalidates raw dist.group.WORLD references cached by external code.
         # Set SLIME_DESTROY_WORLD_PROCESS_GROUP=0 when such references may outlive a train sleep/wake cycle.

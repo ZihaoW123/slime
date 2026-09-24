@@ -1,4 +1,5 @@
 import sys
+import threading
 import types
 from contextlib import contextmanager
 
@@ -7,7 +8,10 @@ import pytest
 from slime.backends.megatron_utils.tms_utils import (
     allow_tms_initial_region_subregions,
     empty_cache_unless_npu_tms_pool_active,
+    npu_tms_temporary_allocation_pool,
+    npu_tms_temporary_allocation_pool_active,
 )
+from slime.utils.memory_utils import clear_memory
 
 
 class _FakeCdll:
@@ -135,3 +139,65 @@ def test_empty_cache_runs_outside_npu_tms_disabled_pool(monkeypatch):
 
     assert empty_cache_unless_npu_tms_pool_active() is True
     assert events[-2:] == [("get", True), ("empty_cache",)]
+
+
+@pytest.mark.unit
+def test_npu_train_temporary_allocations_use_disabled_pool(monkeypatch):
+    events = []
+
+    class Saver:
+        @contextmanager
+        def disable(self):
+            events.append(("disable",))
+            try:
+                yield
+            finally:
+                events.append(("restore",))
+
+    module = types.ModuleType("torch_memory_saver")
+    module.torch_memory_saver = Saver()
+    monkeypatch.setitem(sys.modules, "torch_memory_saver", module)
+    monkeypatch.setenv("TMS_INIT_ENABLE", "1")
+
+    from slime.utils import accelerator
+
+    monkeypatch.setattr(accelerator, "device_type", lambda: "npu")
+    monkeypatch.setattr(accelerator, "synchronize", lambda: events.append(("sync",)))
+    monkeypatch.setattr(accelerator, "empty_cache", lambda: events.append(("empty_cache",)))
+
+    with npu_tms_temporary_allocation_pool(enabled=True):
+        assert npu_tms_temporary_allocation_pool_active() is True
+        events.append(("train",))
+        seen_from_autograd_thread = []
+        thread = threading.Thread(
+            target=lambda: seen_from_autograd_thread.append(npu_tms_temporary_allocation_pool_active())
+        )
+        thread.start()
+        thread.join()
+        assert seen_from_autograd_thread == [True]
+        clear_memory()
+
+    assert npu_tms_temporary_allocation_pool_active() is False
+    assert events == [("disable",), ("train",), ("sync",), ("restore",)]
+
+
+@pytest.mark.unit
+def test_clear_memory_skips_npu_cache_while_tms_pool_is_active(monkeypatch):
+    events = []
+    saver = _FakeTorchMemorySaver(events)
+    saver._impl._binary_wrapper.cdll.interesting_region = False
+    module = types.ModuleType("torch_memory_saver")
+    module.torch_memory_saver = saver
+    monkeypatch.setitem(sys.modules, "torch_memory_saver", module)
+    monkeypatch.setenv("TMS_INIT_ENABLE", "1")
+
+    from slime.utils import accelerator
+
+    monkeypatch.setattr(accelerator, "device_type", lambda: "npu")
+    monkeypatch.setattr(accelerator, "synchronize", lambda: events.append(("sync",)))
+    monkeypatch.setattr(accelerator, "empty_cache", lambda: events.append(("empty_cache",)))
+
+    clear_memory()
+
+    assert ("sync",) in events
+    assert ("empty_cache",) not in events

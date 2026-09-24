@@ -1,5 +1,6 @@
 import gc
 import logging
+import os
 
 import psutil
 import torch
@@ -13,7 +14,28 @@ logger = logging.getLogger(__name__)
 def clear_memory(clear_host_memory: bool = False):
     accelerator.synchronize()
     gc.collect()
-    accelerator.empty_cache()
+    skip_device_cache = False
+    if accelerator.device_type() == "npu" and os.getenv("TMS_INIT_ENABLE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        from slime.backends.megatron_utils.tms_utils import npu_tms_temporary_allocation_pool_active
+
+        skip_device_cache = npu_tms_temporary_allocation_pool_active()
+        if not skip_device_cache:
+            try:
+                from torch_memory_saver import torch_memory_saver
+            except ImportError:
+                pass
+            else:
+                impl = torch_memory_saver._impl
+                skip_device_cache = (
+                    impl is not None and not impl._binary_wrapper.cdll.tms_get_interesting_region()
+                )
+    if not skip_device_cache:
+        accelerator.empty_cache()
     if clear_host_memory and accelerator.supports("host_empty_cache"):
         torch._C._host_emptyCache()
 
