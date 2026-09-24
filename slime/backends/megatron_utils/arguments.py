@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 _ALLGATHER_CP_DSA_ARCHITECTURES = {
     "DeepseekV32ForCausalLM",
+    "Glm5NextForConditionalGeneration",
     "GlmMoeDsaForCausalLM",
 }
 
@@ -38,7 +39,8 @@ def _validate_allgather_cp_supported(args, hf_config=None):
 
     raise ValueError(
         "--allgather-cp with --context-parallel-size > 1 is currently only supported for "
-        "DSA attention models (DeepSeek-V3.2 and GLM-5.1). Non-DSA models still use the "
+        "DSA/contiguous-gather attention models (DeepSeek-V3.2, GLM-5.1, and GLM-5.3). "
+        "Other models still use the "
         "zigzag CP layout and would silently scramble token order under allgather CP. "
         "Please remove --allgather-cp, set --context-parallel-size 1, or use a supported DSA model."
     )

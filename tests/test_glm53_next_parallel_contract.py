@@ -1,5 +1,6 @@
 """CPU checks for the Megatron PP/EP/CP actor's pure contracts."""
 
+import asyncio
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -10,19 +11,25 @@ import torch.multiprocessing as mp
 from slime_plugins.models.glm5_next.contract import hf_weight_name, packed_intervals
 from slime_plugins.models.glm5_next.parallel_model import (
     Glm5NextLocalExperts,
+    Glm5NextMegatronModel,
     forward_packed_moe_layer,
     gather_cp_sequence,
+    make_pipeline_payload,
     validate_parallelism,
 )
 from slime_plugins.models.glm5_next.weight_mapping import checkpoint_name, export_hf_tensor
+from slime_plugins.models.glm5_next.validation import alternating_group_reward
 
 
-def _config():
+def _config(num_layers=4):
     return SimpleNamespace(
         text_config=SimpleNamespace(
-            num_hidden_layers=4,
-            layer_types=["linear_attention"] * 3 + ["deepseek_sparse_attention"],
-            mlp_layer_types=["dense"] * 3 + ["sparse"],
+            num_hidden_layers=num_layers,
+            layer_types=[
+                "deepseek_sparse_attention" if (layer + 1) % 4 == 0 else "linear_attention"
+                for layer in range(num_layers)
+            ],
+            mlp_layer_types=["dense" if layer < 3 else "sparse" for layer in range(num_layers)],
             hidden_size=8,
             intermediate_size=16,
             num_attention_heads=2,
@@ -73,6 +80,32 @@ def test_pp_ep_cp_allowed_but_tp_rejected():
     args.allgather_cp = False
     with pytest.raises(ValueError, match="allgather-cp"):
         validate_parallelism(args, _config())
+
+
+def test_eight_layer_pp2_cp2_ep4_layout_is_accepted():
+    args = _args()
+    args.num_layers = 8
+    validate_parallelism(args, _config(num_layers=8))
+
+
+def test_pipeline_payload_owns_storage_and_preserves_autograd():
+    local = torch.randn(1, 2, 4, 3, requires_grad=True)
+    payload = make_pipeline_payload(local, hc_mult=4, hidden_size=3)
+
+    assert payload.shape == (2, 1, 12)
+    assert payload._base is None
+    payload.sum().backward()
+    assert torch.equal(local.grad, torch.ones_like(local))
+
+
+def test_pipeline_model_declares_untied_embeddings():
+    assert Glm5NextMegatronModel.share_embeddings_and_output_weights is False
+
+
+def test_validation_reward_produces_nonzero_advantages_per_group():
+    samples = [SimpleNamespace(index=index) for index in range(8)]
+    rewards = asyncio.run(alternating_group_reward(None, samples))
+    assert rewards == [0.0, 1.0] * 4
 
 
 def test_router_layout_must_match_published_weights():

@@ -47,6 +47,17 @@ def gather_cp_sequence(local: torch.Tensor, group) -> torch.Tensor:
     return _GatherSequence.apply(local, group)
 
 
+def make_pipeline_payload(local: torch.Tensor, hc_mult: int, hidden_size: int) -> torch.Tensor:
+    """Flatten the mHC streams into an owning tensor for Megatron PP.
+
+    Megatron pseudo-deallocates a stage output after sending it downstream.
+    ``reshape(...).contiguous()`` can still return a view when the reshape is
+    already contiguous, so clone the payload to give the schedule independent
+    storage while preserving its autograd edge.
+    """
+    return local.reshape(local.shape[1], 1, hc_mult * hidden_size).clone()
+
+
 _LOCAL_EXPERT_KEY = ".routed_moe.experts.local_experts."
 
 
@@ -73,10 +84,15 @@ def validate_parallelism(args, hf_config) -> None:
     text = hf_config.text_config
     if getattr(hf_config, "quantization_config", None):
         raise ValueError("Megatron GLM-5.3 actor requires a BF16 checkpoint, not FP8 weights")
-    if text.num_hidden_layers != 4 or list(text.layer_types) != ["linear_attention", "linear_attention", "linear_attention", "deepseek_sparse_attention"]:
-        raise ValueError("Expected a four-layer checkpoint with 3 KDA layers and 1 DSA layer")
-    if list(text.mlp_layer_types) != ["dense", "dense", "dense", "sparse"]:
-        raise ValueError("Expected three dense MLP layers followed by one routed MoE layer")
+    expected_attention = [
+        "deepseek_sparse_attention" if (layer + 1) % 4 == 0 else "linear_attention"
+        for layer in range(text.num_hidden_layers)
+    ]
+    if list(text.layer_types) != expected_attention:
+        raise ValueError("Expected a leading-layer GLM-5.3 checkpoint with KDA/KDA/KDA/DSA attention blocks")
+    expected_mlp = ["dense" if layer < 3 else "sparse" for layer in range(text.num_hidden_layers)]
+    if list(text.mlp_layer_types) != expected_mlp:
+        raise ValueError("Expected the first three MLPs to be dense and all remaining MLPs to be routed MoE")
     if text.n_group != 1 or text.topk_group != 1 or not text.norm_topk_prob:
         raise ValueError("The current Megatron router requires GLM-5.3's one-group, normalized top-k layout")
     expected = {
@@ -288,6 +304,11 @@ def forward_packed_moe_layer(layer, sequences, previous_topk_indices):
 class Glm5NextMegatronModel(nn.Module):
     """One PP stage; pipeline payload is the flattened four-stream mHC state."""
 
+    # The published GLM-5.3 checkpoint has distinct input embedding and output
+    # head weights. Megatron's PP gradient finalizer queries this standard
+    # model interface even when the weights are not shared.
+    share_embeddings_and_output_weights = False
+
     def __init__(self, stage_config, text_config, local_layers, pre_process, post_process, mcore_config, recompute=False):
         super().__init__()
         from transformers.models.glm5_next.modeling_glm5_next import (
@@ -411,7 +432,7 @@ class Glm5NextMegatronModel(nn.Module):
         full = torch.cat(sequence_outputs, dim=1)
         local = full[:, cp_rank * local_length : (cp_rank + 1) * local_length]
         if not self.post_process:
-            return local.reshape(local_length, 1, self.hc_mult * self.hidden_size).contiguous()
+            return make_pipeline_payload(local, self.hc_mult, self.hidden_size)
         collapsed = language_model.norm(local.mean(dim=2))
         return self.hf_model.lm_head(collapsed).float()
 

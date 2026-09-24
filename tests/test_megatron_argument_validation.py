@@ -142,7 +142,7 @@ def test_allgather_cp_rejects_non_dsa_cp_models(monkeypatch):
     args = make_allgather_cp_args()
     hf_config = types.SimpleNamespace(architectures=["Qwen3ForCausalLM"], model_type="qwen3")
 
-    with pytest.raises(ValueError, match="only supported for DSA attention models"):
+    with pytest.raises(ValueError, match="only supported for DSA/contiguous-gather attention models"):
         module._validate_allgather_cp_supported(args, hf_config)
 
 
@@ -151,6 +151,7 @@ def test_allgather_cp_rejects_non_dsa_cp_models(monkeypatch):
     "hf_config",
     [
         types.SimpleNamespace(architectures=["DeepseekV32ForCausalLM"], model_type="deepseek_v3"),
+        types.SimpleNamespace(architectures=["Glm5NextForConditionalGeneration"], model_type="glm5_next"),
         types.SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"], model_type="glm"),
     ],
 )
