@@ -1,5 +1,6 @@
 from argparse import Namespace
 from collections.abc import Callable, Iterator
+from functools import partial
 from typing import Any
 
 import torch
@@ -125,7 +126,7 @@ def get_responses(
         `[R, V]` (policy) or `[R, 1]` (value) and `tokens_chunk` is shape `[R]`
         (1D int64), both aligned to response tokens for one sample.
     """
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    assert logits.dtype in (torch.float32, torch.float16, torch.bfloat16), f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
     assert logits.size(0) == 1, f"{logits.shape}"
     logits = logits.squeeze(0)
@@ -532,7 +533,7 @@ def get_log_probs_and_entropy(
     log-probabilities; entropy is always computed from the unmasked logits.
     """
     assert non_loss_data
-    assert logits.dtype == torch.float32, f"{logits.dtype}"
+    assert logits.dtype in (torch.float32, torch.float16, torch.bfloat16), f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
     assert logits.size(0) == 1, f"{logits.shape}"
     logits = logits.squeeze(0)
@@ -602,6 +603,223 @@ def get_log_probs_and_entropy(
         )
 
     return torch.empty((0,), device=device), res
+
+
+class _ChunkedSelectiveLogSoftmaxLinear(torch.autograd.Function):
+    """Target-token log-softmax with a vocabulary-chunked linear backward.
+
+    The output projection is untied and TP=1 for the GLM-5.3 actor.  A normal
+    Linear backward asks the NPU GEMM implementation for a workspace sized for
+    the complete 155K-token vocabulary.  Computing independent vocabulary
+    rows in bounded chunks preserves the exact log-softmax derivative while
+    bounding both logits and dWeight workspaces.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden, weight, target, temperature: float, vocab_chunk_size: int):
+        if hidden.ndim != 2 or weight.ndim != 2 or target.ndim != 1:
+            raise ValueError("Selective LM head expects hidden/weight rank 2 and target rank 1")
+        if hidden.shape[0] != target.shape[0] or hidden.shape[1] != weight.shape[1]:
+            raise ValueError("Selective LM-head tensor shapes are inconsistent")
+        if temperature <= 0:
+            raise ValueError("rollout_temperature must be positive")
+        if vocab_chunk_size <= 0:
+            raise ValueError("glm53_lm_head_vocab_chunk_size must be positive")
+
+        token_count = hidden.shape[0]
+        selected = torch.empty(token_count, device=hidden.device, dtype=torch.float32)
+        log_partition = None
+        expected_logit = None
+        for start in range(0, weight.shape[0], vocab_chunk_size):
+            end = min(start + vocab_chunk_size, weight.shape[0])
+            logits = F.linear(hidden, weight[start:end]).float().div_(temperature)
+            chunk_partition = torch.logsumexp(logits, dim=-1)
+            chunk_expected_logit = (torch.softmax(logits, dim=-1) * logits).sum(dim=-1)
+            if log_partition is None:
+                log_partition = chunk_partition
+                expected_logit = chunk_expected_logit
+            else:
+                combined_partition = torch.logaddexp(log_partition, chunk_partition)
+                expected_logit = expected_logit * torch.exp(log_partition - combined_partition) + (
+                    chunk_expected_logit * torch.exp(chunk_partition - combined_partition)
+                )
+                log_partition = combined_partition
+            selected_mask = (target >= start) & (target < end)
+            if selected_mask.any().item():
+                selected[selected_mask] = logits[selected_mask, target[selected_mask] - start]
+
+        ctx.save_for_backward(hidden, weight, target, log_partition)
+        ctx.temperature = temperature
+        ctx.vocab_chunk_size = vocab_chunk_size
+        # Megatron DDP preallocates a persistent ``main_grad`` buffer. Writing
+        # dWeight into it chunk-by-chunk avoids materializing a second complete
+        # 155K x hidden gradient while the transformer activations are live.
+        ctx.weight_ref = weight
+        entropy = log_partition - expected_logit
+        ctx.mark_non_differentiable(entropy)
+        return selected - log_partition, entropy
+
+    @staticmethod
+    def backward(ctx, grad_output, _grad_entropy):
+        hidden, weight, target, log_partition = ctx.saved_tensors
+        temperature = ctx.temperature
+        vocab_chunk_size = ctx.vocab_chunk_size
+
+        grad_hidden_fp32 = torch.zeros_like(hidden, dtype=torch.float32) if ctx.needs_input_grad[0] else None
+        main_grad = getattr(ctx.weight_ref, "main_grad", None) if ctx.needs_input_grad[1] else None
+        grad_weight = torch.empty_like(weight) if ctx.needs_input_grad[1] and main_grad is None else None
+        grad_output_fp32 = grad_output.float()
+
+        for start in range(0, weight.shape[0], vocab_chunk_size):
+            end = min(start + vocab_chunk_size, weight.shape[0])
+            weight_chunk = weight[start:end]
+            logits = F.linear(hidden, weight_chunk).float().div_(temperature)
+            grad_logits = -torch.exp(logits - log_partition.unsqueeze(-1)) * grad_output_fp32.unsqueeze(-1)
+            selected_mask = (target >= start) & (target < end)
+            if selected_mask.any().item():
+                grad_logits[selected_mask, target[selected_mask] - start] += grad_output_fp32[selected_mask]
+            grad_logits = grad_logits.div_(temperature).to(hidden.dtype)
+
+            if grad_hidden_fp32 is not None:
+                grad_hidden_fp32.add_(torch.matmul(grad_logits, weight_chunk).float())
+            if ctx.needs_input_grad[1]:
+                grad_weight_chunk = torch.matmul(grad_logits.transpose(0, 1), hidden)
+                if main_grad is not None:
+                    main_grad[start:end].add_(grad_weight_chunk.to(main_grad.dtype))
+                else:
+                    grad_weight[start:end].copy_(grad_weight_chunk)
+
+        if main_grad is not None:
+            ctx.weight_ref.grad_added_to_main_grad = True
+
+        grad_hidden = None if grad_hidden_fp32 is None else grad_hidden_fp32.to(hidden.dtype)
+        return grad_hidden, grad_weight, None, None, None
+
+
+def get_deferred_log_probs_and_entropy(
+    hidden_states: torch.Tensor,
+    output_layer: torch.nn.Module,
+    *,
+    args: Namespace,
+    unconcat_tokens: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
+    with_entropy: bool = False,
+    non_loss_data: bool = True,
+    top_p_token_ids: list[list[int]] | None = None,
+    top_p_token_offsets: list[list[int]] | None = None,
+) -> tuple[torch.Tensor, dict[str, list[torch.Tensor]]]:
+    """Project only response positions through an untied language-model head.
+
+    PPO never consumes prompt-token logits.  Deferring the output projection
+    until after response slicing avoids retaining a full ``[sequence, vocab]``
+    activation on the last pipeline stage.  Projection and vocab-softmax are
+    both chunked, while the resulting per-response tensors have exactly the
+    same layout as :func:`get_log_probs_and_entropy`.
+    """
+    assert non_loss_data
+    if top_p_token_ids is not None or top_p_token_offsets is not None:
+        raise ValueError("Deferred GLM-5.3 LM head currently requires rollout_top_p=1.0")
+
+    response_pairs = list(
+        get_responses(
+            hidden_states,
+            args=args,
+            unconcat_tokens=unconcat_tokens,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            apply_temperature=False,
+        )
+    )
+    tp_group = mpu.get_tensor_model_parallel_group()
+    chunk_size = args.log_probs_chunk_size
+    if chunk_size <= 0:
+        chunk_size = max(response_lengths, default=1)
+    with_entropy_grad = with_entropy and getattr(args, "entropy_coef", 0.0) != 0
+    temperature = getattr(args, "rollout_temperature", 1.0)
+
+    # GLM-5.3 currently requires TP=1.  Compute all response log-probs in one
+    # selective output-head operation so autograd produces one weight gradient
+    # instead of one 155K x hidden gradient per response.  The custom backward
+    # slices the vocabulary as well, avoiding the monolithic LM-head GEMM
+    # workspace that exhausts a 64-GiB final PP rank at 8K context.
+    if not with_entropy_grad and output_layer.bias is None and hasattr(output_layer, "weight"):
+        response_hidden_parts = [pair[0] for pair in response_pairs]
+        response_token_parts = [pair[1] for pair in response_pairs]
+        response_part_lengths = [part.shape[0] for part in response_hidden_parts]
+        if response_hidden_parts:
+            packed_response_hidden = torch.cat(response_hidden_parts, dim=0)
+            packed_response_tokens = torch.cat(response_token_parts, dim=0)
+            packed_log_probs, packed_entropy = _ChunkedSelectiveLogSoftmaxLinear.apply(
+                packed_response_hidden,
+                output_layer.weight,
+                packed_response_tokens,
+                float(temperature),
+                int(getattr(args, "glm53_lm_head_vocab_chunk_size", 1024)),
+            )
+            log_probs_list = list(packed_log_probs.split(response_part_lengths, dim=0))
+        else:
+            log_probs_list = []
+            packed_entropy = hidden_states.new_empty((0,), dtype=torch.float32)
+        res = {"log_probs": log_probs_list}
+        if with_entropy:
+            res["entropy"] = list(packed_entropy.split(response_part_lengths, dim=0))
+        if args.allgather_cp:
+            _allgather_cp_redistribute(
+                res,
+                logits_local_len=hidden_states.size(1),
+                total_lengths=total_lengths,
+                response_lengths=response_lengths,
+            )
+        return torch.empty((0,), device=hidden_states.device), res
+
+    log_probs_list = []
+    entropy_list = []
+    for response_hidden, response_tokens in response_pairs:
+        sample_log_probs = []
+        sample_entropies = []
+        for hidden_chunk, token_chunk in zip(
+            response_hidden.split(chunk_size, dim=0),
+            response_tokens.split(chunk_size, dim=0),
+            strict=True,
+        ):
+            logits_chunk = output_layer(hidden_chunk)
+            if temperature != 1.0:
+                logits_chunk = logits_chunk / temperature
+            log_prob, entropy = calculate_log_probs_and_entropy(
+                logits_chunk,
+                token_chunk,
+                tp_group,
+                with_entropy=with_entropy,
+                with_entropy_grad=with_entropy_grad,
+                chunk_size=-1,
+            )
+            sample_log_probs.append(log_prob.squeeze(-1))
+            if entropy is not None:
+                sample_entropies.append(entropy)
+
+        if sample_log_probs:
+            log_probs_list.append(torch.cat(sample_log_probs, dim=0))
+        else:
+            # Preserve a differentiable zero edge for CP ranks that own no
+            # response positions, without allocating an empty vocab tensor.
+            log_probs_list.append(response_hidden.sum(dim=-1))
+        if with_entropy:
+            entropy_list.append(
+                torch.cat(sample_entropies, dim=0) if sample_entropies else response_hidden.sum(dim=-1)
+            )
+
+    res = {"log_probs": log_probs_list}
+    if with_entropy:
+        res["entropy"] = entropy_list
+    if args.allgather_cp:
+        _allgather_cp_redistribute(
+            res,
+            logits_local_len=hidden_states.size(1),
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+        )
+    return torch.empty((0,), device=hidden_states.device), res
 
 
 def get_values(
@@ -935,6 +1153,7 @@ def policy_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    output_layer: torch.nn.Module | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute policy loss (PPO/GSPO) and metrics.
 
@@ -966,8 +1185,11 @@ def policy_loss_function(
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
 
-    _, log_probs_and_entropy = get_log_probs_and_entropy(
+    log_prob_func = get_deferred_log_probs_and_entropy if output_layer is not None else get_log_probs_and_entropy
+    deferred_kwargs = {"output_layer": output_layer} if output_layer is not None else {}
+    _, log_probs_and_entropy = log_prob_func(
         logits,
+        **deferred_kwargs,
         args=args,
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
@@ -1285,6 +1507,7 @@ def loss_function(
     num_microbatches: int,
     step_global_batch_size: int,
     logits: torch.Tensor,
+    deferred_output_layer: torch.nn.Module | None = None,
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
@@ -1325,7 +1548,7 @@ def loss_function(
 
     match args.loss_type:
         case "policy_loss":
-            func = policy_loss_function
+            func = partial(policy_loss_function, output_layer=deferred_output_layer)
         case "value_loss":
             func = value_loss_function
         case "sft_loss":

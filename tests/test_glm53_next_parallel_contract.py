@@ -9,10 +9,17 @@ import torch
 import torch.multiprocessing as mp
 
 from slime_plugins.models.glm5_next.contract import hf_weight_name, packed_intervals
+from slime_plugins.models.glm5_next.kernels import (
+    GLM53_KERNEL_BACKENDS,
+    _ascendc_causal_conv1d,
+    _triton_causal_conv1d,
+    load_kda_kernel,
+)
 from slime_plugins.models.glm5_next.parallel_model import (
     Glm5NextLocalExperts,
     Glm5NextMegatronModel,
     _causal_kda_decay_mask,
+    configure_npu_attention,
     forward_packed_moe_layer,
     gather_cp_sequence,
     make_pipeline_payload,
@@ -27,10 +34,7 @@ def _config(num_layers=4):
     return SimpleNamespace(
         text_config=SimpleNamespace(
             num_hidden_layers=num_layers,
-            layer_types=[
-                "deepseek_sparse_attention" if (layer + 1) % 4 == 0 else "linear_attention"
-                for layer in range(num_layers)
-            ],
+            layer_types=["deepseek_sparse_attention" if (layer + 1) % 4 == 0 else "linear_attention" for layer in range(num_layers)],
             mlp_layer_types=["dense" if layer < 3 else "sparse" for layer in range(num_layers)],
             hidden_size=8,
             intermediate_size=16,
@@ -65,6 +69,9 @@ def _args():
         expert_tensor_parallel_size=1,
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=2,
+        decoder_first_pipeline_num_layers=None,
+        decoder_last_pipeline_num_layers=None,
+        pipeline_model_parallel_layout=None,
         context_parallel_size=2,
         expert_model_parallel_size=4,
         virtual_pipeline_model_parallel_size=None,
@@ -90,6 +97,27 @@ def test_eight_layer_pp2_cp2_ep4_layout_is_accepted():
     validate_parallelism(args, _config(num_layers=8))
 
 
+def test_45_layer_uneven_pp4_layout_is_accepted():
+    args = _args()
+    args.num_layers = 45
+    args.pipeline_model_parallel_size = 4
+    args.pipeline_model_parallel_layout = "Et*12|t*11|t*11|t*11L"
+    validate_parallelism(args, _config(num_layers=45))
+
+    args.pipeline_model_parallel_layout = None
+    args.decoder_first_pipeline_num_layers = 15
+    args.decoder_last_pipeline_num_layers = 0
+    validate_parallelism(args, _config(num_layers=45))
+
+    args.decoder_last_pipeline_num_layers = 1
+    with pytest.raises(ValueError, match="equal positive layer count.*middle"):
+        validate_parallelism(args, _config(num_layers=45))
+
+    args.decoder_last_pipeline_num_layers = -1
+    with pytest.raises(ValueError, match="last pipeline stage"):
+        validate_parallelism(args, _config(num_layers=45))
+
+
 def test_pipeline_payload_owns_storage_and_preserves_autograd():
     local = torch.randn(1, 2, 4, 3, requires_grad=True)
     payload = make_pipeline_payload(local, hc_mult=4, hidden_size=3)
@@ -104,9 +132,19 @@ def test_pipeline_model_declares_untied_embeddings():
     assert Glm5NextMegatronModel.share_embeddings_and_output_weights is False
 
 
+def test_npu_attention_uses_memory_efficient_sdpa():
+    config = SimpleNamespace(_attn_implementation="eager")
+    configure_npu_attention(config)
+    assert config._attn_implementation == "sdpa"
+
+
 def test_validation_reward_produces_nonzero_advantages_per_group():
     samples = [SimpleNamespace(index=index) for index in range(8)]
-    rewards = asyncio.run(alternating_group_reward(None, samples))
+
+    async def collect_rewards():
+        return await asyncio.gather(*(alternating_group_reward(None, sample) for sample in samples))
+
+    rewards = asyncio.run(collect_rewards())
     assert rewards == [0.0, 1.0] * 4
 
 
@@ -134,6 +172,51 @@ def test_stable_eager_kda_backward_is_finite_for_strong_decay():
     assert all(torch.isfinite(tensor.grad).all() for tensor in (query, key, value, g))
 
 
+def test_glm53_kernel_backend_contract_and_eager_fallback():
+    assert GLM53_KERNEL_BACKENDS == ("ascendc", "triton", "eager")
+    eager = object()
+    assert load_kda_kernel("eager", eager) is eager
+    with pytest.raises(ValueError, match="Unknown GLM-5.3 KDA backend"):
+        load_kda_kernel("unknown", eager)
+
+
+def test_triton_causal_conv1d_layout_adapter():
+    hidden = torch.randn(2, 12, 5)
+    weight = torch.randn(12, 3)
+
+    def fake_operator(*, x, weight, bias, activation):
+        assert x.shape == (2, 5, 12)
+        assert weight.shape == (3, 12)
+        assert bias is None
+        assert activation == "silu"
+        return x * 2, None
+
+    output = _triton_causal_conv1d(hidden, weight, None, "silu", fake_operator)
+    torch.testing.assert_close(output, hidden * 2)
+
+
+def test_ascendc_causal_conv1d_splits_qkv_and_restores_layout():
+    hidden = torch.randn(2, 24, 5)
+    weight = torch.randn(24, 3)
+    calls = []
+
+    def fake_operator(*, x, weight, H, bias, activation):
+        calls.append((x.shape, weight.shape, H, bias, activation))
+        head_dim = x.shape[-1] // H
+        return x.reshape(x.shape[0], x.shape[1], H, head_dim).transpose(1, 2), None
+
+    output = _ascendc_causal_conv1d(
+        hidden,
+        weight,
+        bias=None,
+        activation="silu",
+        num_heads=2,
+        operator=fake_operator,
+    )
+    torch.testing.assert_close(output, hidden)
+    assert calls == [((2, 5, 8), (8, 3), 2, None, "silu")] * 3
+
+
 def test_router_layout_must_match_published_weights():
     args = _args()
     args.moe_router_topk_scaling_factor = 1.0
@@ -157,6 +240,7 @@ def test_local_experts_use_global_ids_and_router_weights(monkeypatch):
         moe_ffn_hidden_size=4,
         glm53_swiglu_limit=10.0,
         expert_model_parallel_size=2,
+        recompute_granularity="full",
     )
     experts = Glm5NextLocalExperts(
         2,
@@ -165,7 +249,8 @@ def test_local_experts_use_global_ids_and_router_weights(monkeypatch):
     )
     assert list(experts.local_experts) == ["2", "3"]
     assert all(parameter.allreduce is False for parameter in experts.parameters())
-    hidden = torch.randn(3, 8)
+    experts.expert_token_chunk_size = 1
+    hidden = torch.randn(3, 8, requires_grad=True)
     weights = torch.tensor([0.2, 0.5, 0.8])
     output, bias = experts(hidden, torch.tensor([2, 1]), weights)
     expected = torch.cat(
@@ -176,6 +261,8 @@ def test_local_experts_use_global_ids_and_router_weights(monkeypatch):
     )
     assert bias is None
     torch.testing.assert_close(output, expected)
+    output.sum().backward()
+    assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
 
     calls = []
 
@@ -226,7 +313,7 @@ def test_expert_checkpoint_replica_ids_use_expert_data_parallel_rank():
     assert shared.replica_id == (0, 0, 7)
 
 
-def test_packed_moe_layer_dispatches_once_for_different_length_sequences():
+def test_packed_moe_layer_dispatches_synchronized_chunks_for_different_length_sequences(monkeypatch):
     class IdentityHyperConnection(torch.nn.Module):
         def forward(self, hidden):
             batch, sequence, streams, _ = hidden.shape
@@ -235,10 +322,13 @@ def test_packed_moe_layer_dispatches_once_for_different_length_sequences():
             return post, comb, hidden.mean(dim=2)
 
     class Attention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lengths = []
+
         def forward(self, hidden_states, **kwargs):
-            return hidden_states + 1, None, torch.zeros(
-                (*hidden_states.shape[:2], 1), dtype=torch.int32
-            )
+            self.lengths.append(hidden_states.shape[1])
+            return hidden_states + 1, None, torch.zeros((*hidden_states.shape[:2], 1), dtype=torch.int32)
 
     class CountingMoe(torch.nn.Module):
         def __init__(self):
@@ -247,7 +337,9 @@ def test_packed_moe_layer_dispatches_once_for_different_length_sequences():
 
         def forward(self, hidden):
             self.calls.append(hidden.shape)
-            return hidden * 2
+            # Square forces non-reentrant checkpoint to replay the block;
+            # multiplying by a constant needs no saved forward tensor.
+            return hidden.square()
 
     layer = SimpleNamespace(
         block_type="deepseek_sparse_attention",
@@ -258,11 +350,35 @@ def test_packed_moe_layer_dispatches_once_for_different_length_sequences():
         post_attention_layernorm=torch.nn.Identity(),
         mlp=CountingMoe(),
     )
-    sequences = [torch.ones(1, 2, 2, 4), torch.ones(1, 3, 2, 4)]
-    outputs, topk = forward_packed_moe_layer(layer, sequences, [None, None])
+    ep_group = object()
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
 
-    assert layer.mlp.calls == [torch.Size([1, 5, 4])]
+    def fake_all_reduce(length, op, group):
+        assert group is ep_group
+        assert op is torch.distributed.ReduceOp.MAX
+        length.fill_(6)  # Simulate a peer with one more packed token.
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+    sequences = [torch.ones(1, 2, 2, 4, requires_grad=True), torch.ones(1, 3, 2, 4, requires_grad=True)]
+    outputs, topk = forward_packed_moe_layer(
+        layer,
+        sequences,
+        [None, None],
+        recompute=True,
+        moe_dispatch_token_chunk_size=3,
+        expert_parallel_group=ep_group,
+    )
+    sum(output.sum() for output in outputs).backward()
+
+    assert layer.mlp.calls == [
+        torch.Size([1, 3, 4]),
+        torch.Size([1, 3, 4]),
+        torch.Size([1, 3, 4]),
+        torch.Size([1, 3, 4]),
+    ]
+    assert sorted(layer.self_attn.lengths) == [2, 2, 3, 3]
     assert [output.shape for output in outputs] == [torch.Size([1, 2, 2, 4]), torch.Size([1, 3, 2, 4])]
+    assert all(sequence.grad is not None and torch.isfinite(sequence.grad).all() for sequence in sequences)
     assert all(indices is not None for indices in topk)
 
 
@@ -280,3 +396,61 @@ def _cp_worker(rank: int, rendezvous: str):
 
 def test_cp_gather_propagates_gradients_across_ranks(tmp_path: Path):
     mp.spawn(_cp_worker, args=(str(tmp_path / "rendezvous"),), nprocs=2, join=True)
+
+
+def test_deferred_lm_head_matches_full_sequence_log_probs_and_gradients(monkeypatch):
+    pytest.importorskip("megatron")
+    from slime.backends.megatron_utils import loss as loss_module
+
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(loss_module.mpu, "get_tensor_model_parallel_group", lambda: None)
+    args = SimpleNamespace(
+        rollout_temperature=1.25,
+        log_probs_chunk_size=1,
+        glm53_lm_head_vocab_chunk_size=3,
+        entropy_coef=0.0,
+        allgather_cp=False,
+    )
+    tokens = [torch.tensor([1, 2, 3, 4]), torch.tensor([5, 6, 7])]
+    total_lengths = [4, 3]
+    response_lengths = [2, 1]
+
+    hidden = torch.randn(1, sum(total_lengths), 5, requires_grad=True)
+    output_layer = torch.nn.Linear(5, 11, bias=False)
+    output_layer.weight.main_grad = torch.zeros_like(output_layer.weight)
+    _, deferred = loss_module.get_deferred_log_probs_and_entropy(
+        hidden,
+        output_layer,
+        args=args,
+        unconcat_tokens=tokens,
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        with_entropy=True,
+    )
+    deferred_log_probs = torch.cat(deferred["log_probs"])
+    deferred_entropy = torch.cat(deferred["entropy"])
+    deferred_log_probs.sum().backward()
+    hidden_grad = hidden.grad.clone()
+    assert output_layer.weight.grad is None
+    assert output_layer.weight.grad_added_to_main_grad
+    weight_grad = output_layer.weight.main_grad.clone()
+
+    reference_hidden = hidden.detach().clone().requires_grad_()
+    reference_layer = torch.nn.Linear(5, 11, bias=False)
+    reference_layer.weight.data.copy_(output_layer.weight.data)
+    _, reference = loss_module.get_log_probs_and_entropy(
+        reference_layer(reference_hidden),
+        args=args,
+        unconcat_tokens=tokens,
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        with_entropy=True,
+    )
+    reference_log_probs = torch.cat(reference["log_probs"])
+    reference_entropy = torch.cat(reference["entropy"])
+    reference_log_probs.sum().backward()
+
+    torch.testing.assert_close(deferred_log_probs, reference_log_probs)
+    torch.testing.assert_close(deferred_entropy, reference_entropy)
+    torch.testing.assert_close(hidden_grad, reference_hidden.grad)
+    torch.testing.assert_close(weight_grad, reference_layer.weight.grad)

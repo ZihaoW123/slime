@@ -182,6 +182,29 @@ def test_npu_train_temporary_allocations_use_disabled_pool(monkeypatch):
 
 
 @pytest.mark.unit
+def test_npu_train_temporary_pool_can_be_disabled_for_large_operator_workspaces(monkeypatch):
+    events = []
+
+    class Saver:
+        @contextmanager
+        def disable(self):
+            events.append(("disable",))
+            yield
+
+    module = types.ModuleType("torch_memory_saver")
+    module.torch_memory_saver = Saver()
+    monkeypatch.setitem(sys.modules, "torch_memory_saver", module)
+    monkeypatch.setenv("TMS_INIT_ENABLE", "1")
+    monkeypatch.setenv("SLIME_NPU_TMS_TEMPORARY_POOL", "0")
+
+    with npu_tms_temporary_allocation_pool(enabled=True):
+        assert npu_tms_temporary_allocation_pool_active() is False
+        events.append(("train",))
+
+    assert events == [("train",)]
+
+
+@pytest.mark.unit
 def test_clear_memory_skips_npu_cache_while_tms_pool_is_active(monkeypatch):
     events = []
     saver = _FakeTorchMemorySaver(events)

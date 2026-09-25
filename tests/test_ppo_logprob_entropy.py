@@ -263,6 +263,33 @@ def test_calculate_log_probs_and_entropy_matches_unfused_reference_single_rank(
     torch.testing.assert_close(logits.grad, expected_grad, rtol=STRICT_RTOL, atol=STRICT_ATOL)
 
 
+def test_calculate_log_probs_promotes_bf16_chunks_and_restores_gradient_dtype():
+    logits = _single_rank_logits().to(torch.bfloat16).requires_grad_()
+    tokens = torch.tensor([3, 0, 1], dtype=torch.long)
+
+    log_probs, entropy = calculate_log_probs_and_entropy(
+        logits,
+        tokens,
+        tp_group=None,
+        with_entropy=False,
+        chunk_size=2,
+    )
+
+    expected_log_probs, _ = _unfused_reference_logprob_entropy(
+        logits.detach().float(),
+        tokens,
+        None,
+        with_entropy=False,
+    )
+    torch.testing.assert_close(log_probs, expected_log_probs, rtol=2e-2, atol=2e-2)
+    assert entropy is None
+
+    log_probs.sum().backward()
+    assert logits.grad is not None
+    assert logits.grad.dtype == torch.bfloat16
+    assert torch.isfinite(logits.grad).all()
+
+
 @pytest.mark.parametrize("with_entropy", [False, True])
 def test_calculate_log_probs_and_entropy_handles_empty_input(with_entropy: bool):
     logits = torch.empty((0, 4), dtype=torch.float32, requires_grad=True)

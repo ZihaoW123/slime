@@ -1,8 +1,8 @@
-"""Megatron PP/EP/CP actor for reduced GLM-5.3-Flash (TP=1).
+"""Megatron PP/EP/CP actor for GLM-5.3-Flash (TP=1).
 
 Megatron owns the pipeline schedule, distributed optimizer, and expert token
-dispatcher. The new KDA/DSA/mHC math deliberately uses the reference eager
-Transformers modules until the Ascend fused implementations are validated.
+dispatcher. KDA and causal-conv1d can use AscendC, Triton-Ascend, or the
+reference eager implementation selected by command-line arguments.
 CP first reconstructs the packed sequence with a differentiable all-gather;
 this is a correctness path, not a memory-saving CP attention kernel.
 """
@@ -56,9 +56,7 @@ def stable_chunk_kimi_delta_attention(
     from transformers.models.glm5_next.modeling_glm5_next import l2norm
 
     initial_dtype = query.dtype
-    query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
-    ]
+    query, key, value, beta, g = [x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)]
     if use_qk_l2norm_in_kernel:
         query = l2norm(query, dim=-1, eps=1e-6)
         key = l2norm(key, dim=-1, eps=1e-6)
@@ -77,20 +75,13 @@ def stable_chunk_kimi_delta_attention(
     v_beta = value * beta.unsqueeze(-1)
     k_beta = key * beta.unsqueeze(-1)
 
-    query, key, value, g, k_beta, v_beta = [
-        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1])
-        for x in (query, key, value, g, k_beta, v_beta)
-    ]
+    query, key, value, g, k_beta, v_beta = [x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, g, k_beta, v_beta)]
     beta = beta.reshape(beta.shape[0], beta.shape[1], -1, chunk_size)
 
     g = g.cumsum(dim=-2)
-    upper_with_diagonal = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
-    )
+    upper_with_diagonal = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
     decay_mask = _causal_kda_decay_mask(g, chunk_size)
-    attn = -(k_beta.unsqueeze(-2) * key.unsqueeze(-3) * decay_mask).sum(dim=-1).masked_fill(
-        upper_with_diagonal, 0
-    )
+    attn = -(k_beta.unsqueeze(-2) * key.unsqueeze(-3) * decay_mask).sum(dim=-1).masked_fill(upper_with_diagonal, 0)
     for i in range(1, chunk_size):
         row = attn[..., i, :i].clone()
         sub = attn[..., :i, :i].clone()
@@ -114,9 +105,7 @@ def stable_chunk_kimi_delta_attention(
     )
     core_attn_out = torch.zeros_like(value)
 
-    strict_upper = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
-    )
+    strict_upper = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
     for i in range(total_sequence_length // chunk_size):
         q_i = query[:, :, i]
         k_i = key[:, :, i]
@@ -124,26 +113,17 @@ def stable_chunk_kimi_delta_attention(
         g_i = g[:, :, i]
 
         attn_inter = (q_i * g_i.exp()) @ last_recurrent_state
-        attn_intra = (
-            (q_i.unsqueeze(-2) * k_i.unsqueeze(-3) * decay_mask[:, :, i])
-            .sum(dim=-1)
-            .masked_fill(strict_upper, 0)
-        )
+        attn_intra = (q_i.unsqueeze(-2) * k_i.unsqueeze(-3) * decay_mask[:, :, i]).sum(dim=-1).masked_fill(strict_upper, 0)
         v_prime = k_cumdecay[:, :, i] @ last_recurrent_state
         v_new = v_i - v_prime
 
         core_attn_out[:, :, i] = attn_inter + attn_intra @ v_new
-        last_recurrent_state = (
-            last_recurrent_state * g_i[:, :, -1].exp().unsqueeze(-1)
-            + (k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new
-        )
+        last_recurrent_state = last_recurrent_state * g_i[:, :, -1].exp().unsqueeze(-1) + (k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new
 
     if not output_final_state:
         last_recurrent_state = None
 
-    core_attn_out = core_attn_out.reshape(
-        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
-    )
+    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
     core_attn_out = core_attn_out[:, :, :sequence_length]
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
     return core_attn_out, last_recurrent_state
@@ -220,10 +200,7 @@ def validate_parallelism(args, hf_config) -> None:
     text = hf_config.text_config
     if getattr(hf_config, "quantization_config", None):
         raise ValueError("Megatron GLM-5.3 actor requires a BF16 checkpoint, not FP8 weights")
-    expected_attention = [
-        "deepseek_sparse_attention" if (layer + 1) % 4 == 0 else "linear_attention"
-        for layer in range(text.num_hidden_layers)
-    ]
+    expected_attention = ["deepseek_sparse_attention" if (layer + 1) % 4 == 0 else "linear_attention" for layer in range(text.num_hidden_layers)]
     if list(text.layer_types) != expected_attention:
         raise ValueError("Expected a leading-layer GLM-5.3 checkpoint with KDA/KDA/KDA/DSA attention blocks")
     expected_mlp = ["dense" if layer < 3 else "sparse" for layer in range(text.num_hidden_layers)]
@@ -258,12 +235,45 @@ def validate_parallelism(args, hf_config) -> None:
         raise ValueError("GLM-5.3 Megatron actor does not yet support tensor parallelism; set TP=1")
     if getattr(args, "virtual_pipeline_model_parallel_size", None):
         raise ValueError("GLM-5.3 Megatron actor does not yet support virtual pipeline stages")
-    if args.num_layers % args.pipeline_model_parallel_size:
-        raise ValueError("The reduced model requires an even PP split (PP=1, 2, or 4)")
+    pp_size = args.pipeline_model_parallel_size
+    pipeline_layout = getattr(args, "pipeline_model_parallel_layout", None)
+    first_stage_layers = getattr(args, "decoder_first_pipeline_num_layers", None)
+    last_stage_layers = getattr(args, "decoder_last_pipeline_num_layers", None)
+    if pipeline_layout is not None:
+        if first_stage_layers is not None or last_stage_layers is not None:
+            raise ValueError("pipeline layout cannot be combined with edge-stage layer counts")
+    elif first_stage_layers is None and last_stage_layers is None:
+        if args.num_layers % pp_size:
+            raise ValueError("num_layers must divide PP unless an edge-stage layer count is set")
+    else:
+        if pp_size < 2:
+            raise ValueError("uneven pipeline stages require PP > 1")
+        if first_stage_layers is not None and not 1 <= first_stage_layers < args.num_layers:
+            raise ValueError("the first pipeline stage must contain between 1 and num_layers-1 decoder layers")
+        if last_stage_layers is not None and not 0 <= last_stage_layers < args.num_layers:
+            raise ValueError("the last pipeline stage must contain between 0 and num_layers-1 decoder layers")
+        edge_layers = [value for value in (first_stage_layers, last_stage_layers) if value is not None]
+        middle_stage_count = pp_size - len(edge_layers)
+        middle_layers = args.num_layers - sum(edge_layers)
+        if middle_stage_count == 0:
+            valid_split = middle_layers == 0
+        else:
+            valid_split = middle_layers > 0 and middle_layers % middle_stage_count == 0
+        if not valid_split:
+            raise ValueError("pipeline edge stages must leave an equal positive layer count for every middle PP stage")
     if text.n_routed_experts % args.expert_model_parallel_size:
         raise ValueError("The expert count must be divisible by EP")
     if not getattr(args, "allgather_cp", False) and args.context_parallel_size > 1:
         raise ValueError("GLM-5.3 CP requires --allgather-cp for contiguous packed shards")
+
+
+def configure_npu_attention(text_config) -> None:
+    """Select the memory-efficient Transformers attention path on Ascend."""
+    # GLM-5.3's DSA layers still build a dense boolean visibility mask.  The
+    # eager implementation materializes the full FP32 attention matrix and
+    # needs about 15 GiB per 8K sequence.  Transformers' NPU SDPA adapter keeps
+    # the mask boolean and dispatches FlashAttentionScore instead.
+    text_config._attn_implementation = "sdpa"
 
 
 class _LocalExpert(nn.Module):
@@ -292,6 +302,14 @@ class Glm5NextLocalExperts(nn.Module):
         ep_rank = dist.get_rank(pg_collection.ep)
         self.tp_group = pg_collection.expt_tp
         self.dp_group = pg_collection.expt_dp
+        self.recompute = (
+            getattr(config, "recompute_granularity", None) == "full"
+            and not getattr(config, "glm53_outer_moe_recompute", False)
+        )
+        # Keep the expert MLP and fp32 router weighting inside one checkpointed
+        # region.  For an 8K sequence, converting a complete expert output to
+        # fp32 otherwise creates a ~0.5 GiB transient tensor per EP rank.
+        self.expert_token_chunk_size = 1024
         self.local_experts = nn.ModuleDict()
         first_id = ep_rank * num_local_experts
         for global_id in range(first_id, first_id + num_local_experts):
@@ -304,10 +322,34 @@ class Glm5NextLocalExperts(nn.Module):
         counts = tokens_per_expert.tolist()
         chunks = hidden.split(counts, dim=0)
         prob_chunks = probs.split(counts, dim=0)
-        outputs = []
+        # Avoid retaining every expert output and then allocating a second
+        # full-size buffer in torch.cat.  At 8K/top-k=8 that transient copy is
+        # about 0.5 GiB per EP rank and is enough to OOM a middle PP stage.
+        output = hidden.new_empty(hidden.shape)
+        offset = 0
         for expert, tokens, weights in zip(self.local_experts.values(), chunks, prob_chunks, strict=True):
-            outputs.append((expert(tokens).float() * weights.float().unsqueeze(-1)).to(hidden.dtype))
-        output = torch.cat(outputs, dim=0) if outputs else hidden.new_empty(hidden.shape)
+            for token_chunk, weight_chunk in zip(
+                tokens.split(self.expert_token_chunk_size, dim=0),
+                weights.split(self.expert_token_chunk_size, dim=0),
+                strict=True,
+            ):
+
+                def weighted_expert(token_input, router_weight, module=expert):
+                    expert_output = module(token_input)
+                    return (expert_output.float() * router_weight.float().unsqueeze(-1)).to(hidden.dtype)
+
+                if self.recompute and self.training and token_chunk.requires_grad:
+                    weighted = checkpoint(
+                        weighted_expert,
+                        token_chunk,
+                        weight_chunk,
+                        use_reentrant=False,
+                    )
+                else:
+                    weighted = weighted_expert(token_chunk, weight_chunk)
+                next_offset = offset + token_chunk.shape[0]
+                output[offset:next_offset] = weighted
+                offset = next_offset
         return output, None
 
     def backward_dw(self):
@@ -357,15 +399,30 @@ class Glm5NextMegatronMoE(nn.Module):
             config=text_config,
             intermediate_size=text_config.moe_intermediate_size * text_config.n_shared_experts,
         )
+        self.recompute = (
+            getattr(mcore_config, "recompute_granularity", None) == "full"
+            and not getattr(mcore_config, "glm53_outer_moe_recompute", False)
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         routed, bias = self.routed_moe(hidden_states.transpose(0, 1).contiguous())
         if bias is not None:
             routed = routed + bias
-        return routed.transpose(0, 1).contiguous() + self.shared_experts(hidden_states)
+        if self.recompute and self.training and hidden_states.requires_grad:
+            shared = checkpoint(self.shared_experts, hidden_states, use_reentrant=False)
+        else:
+            shared = self.shared_experts(hidden_states)
+        return routed.transpose(0, 1).contiguous() + shared
 
 
-def forward_packed_moe_layer(layer, sequences, previous_topk_indices):
+def forward_packed_moe_layer(
+    layer,
+    sequences,
+    previous_topk_indices,
+    recompute=False,
+    moe_dispatch_token_chunk_size=512,
+    expert_parallel_group=None,
+):
     """Run attention per packed sequence and dispatch all tokens through MoE once.
 
     Dynamic batching can assign a different number of packed sequences to each
@@ -390,29 +447,42 @@ def forward_packed_moe_layer(layer, sequences, previous_topk_indices):
         positions = torch.arange(length, device=hidden_states.device).unsqueeze(0)
         valid = torch.ones(1, length, device=hidden_states.device, dtype=torch.bool)
 
-        residual = hidden_states
-        post, comb, attention_input = layer.attn_hc(hidden_states)
-        attention_input = layer.input_layernorm(attention_input)
-        if layer.block_type == "linear_attention":
-            attention_output = layer.self_attn(
-                hidden_states=attention_input,
-                cache_params=None,
-                attention_mask=valid,
-            )
-            topk_indices = None
+        # Bind sequence-local metadata in the closure.  Checkpoint invokes this
+        # function again during backward, after the loop has advanced to later
+        # packed sequences.
+        def attention_block(x, valid=valid, positions=positions, previous=previous, dtype=dtype):
+            residual = x
+            post, comb, attention_input = layer.attn_hc(x)
+            attention_input = layer.input_layernorm(attention_input)
+            if layer.block_type == "linear_attention":
+                attention_output = layer.self_attn(
+                    hidden_states=attention_input,
+                    cache_params=None,
+                    attention_mask=valid,
+                )
+                topk = None
+            else:
+                attention_output, _, topk = layer.self_attn(
+                    hidden_states=attention_input,
+                    attention_mask=valid,
+                    position_ids=positions,
+                    past_key_values=None,
+                    use_cache=False,
+                    position_embeddings=None,
+                    prev_topk_indices=previous,
+                )
+            output = post.to(dtype).unsqueeze(-1) * attention_output.unsqueeze(-2)
+            output = output + torch.matmul(comb.to(dtype).transpose(-1, -2), residual)
+            return output if topk is None else (output, topk)
+
+        if recompute and hidden_states.requires_grad:
+            attention_result = checkpoint(attention_block, hidden_states, use_reentrant=False)
         else:
-            attention_output, _, topk_indices = layer.self_attn(
-                hidden_states=attention_input,
-                attention_mask=valid,
-                position_ids=positions,
-                past_key_values=None,
-                use_cache=False,
-                position_embeddings=None,
-                prev_topk_indices=previous,
-            )
-        hidden_states = post.to(dtype).unsqueeze(-1) * attention_output.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), residual
-        )
+            attention_result = attention_block(hidden_states)
+        if isinstance(attention_result, tuple):
+            hidden_states, topk_indices = attention_result
+        else:
+            hidden_states, topk_indices = attention_result, None
 
         residual = hidden_states
         post, comb, ffn_input = layer.ffn_hc(hidden_states)
@@ -423,17 +493,47 @@ def forward_packed_moe_layer(layer, sequences, previous_topk_indices):
         next_topk_indices.append(topk_indices)
         lengths.append(length)
 
-    packed_ffn_output = layer.mlp(torch.cat(ffn_inputs, dim=1))
+    packed_ffn_input = torch.cat(ffn_inputs, dim=1)
+    original_packed_length = packed_ffn_input.shape[1]
+    if moe_dispatch_token_chunk_size < 1:
+        raise ValueError("GLM-5.3 MoE dispatch token chunk size must be positive")
+    # Dynamic batching may assign a different token count to each data rank,
+    # while those ranks form one EP group. Synchronize and pad to the maximum
+    # so every EP peer issues identical all-to-all chunk shapes. Dummy zero
+    # tokens have zero expert/shared-MLP output and are removed before
+    # reconstructing the packed sequences.
+    max_packed_length = original_packed_length
+    if expert_parallel_group is not None and torch.distributed.get_world_size(expert_parallel_group) > 1:
+        length_tensor = torch.tensor(max_packed_length, device=packed_ffn_input.device, dtype=torch.int64)
+        torch.distributed.all_reduce(length_tensor, op=torch.distributed.ReduceOp.MAX, group=expert_parallel_group)
+        max_packed_length = int(length_tensor.item())
+    if original_packed_length < max_packed_length:
+        padding = packed_ffn_input.new_zeros(
+            packed_ffn_input.shape[0],
+            max_packed_length - original_packed_length,
+            packed_ffn_input.shape[2],
+        )
+        packed_ffn_input = torch.cat((packed_ffn_input, padding), dim=1)
+    packed_ffn_outputs = []
+    for ffn_input_chunk in packed_ffn_input.split(moe_dispatch_token_chunk_size, dim=1):
+        if recompute and ffn_input_chunk.requires_grad:
+            # Top-k routing expands every token into multiple expert-token
+            # rows.  Dispatching the whole 8K context at once creates a large
+            # masked-select/all-to-all working set on every EP rank.  All EP
+            # ranks have the same packed sequence length, so identical token
+            # chunks preserve collective ordering while bounding that working
+            # set. Checkpoint the complete routed block to release its router
+            # and dispatcher activations between pipeline layers.
+            ffn_output_chunk = checkpoint(layer.mlp, ffn_input_chunk, use_reentrant=False)
+        else:
+            ffn_output_chunk = layer.mlp(ffn_input_chunk)
+        packed_ffn_outputs.append(ffn_output_chunk)
+    packed_ffn_output = torch.cat(packed_ffn_outputs, dim=1)[:, :original_packed_length]
     sequence_ffn_outputs = packed_ffn_output.split(lengths, dim=1)
     outputs = []
-    for ffn_output, residual, post, comb in zip(
-        sequence_ffn_outputs, residuals, ffn_posts, ffn_combs, strict=True
-    ):
+    for ffn_output, residual, post, comb in zip(sequence_ffn_outputs, residuals, ffn_posts, ffn_combs, strict=True):
         dtype = residual.dtype
-        outputs.append(
-            post.to(dtype).unsqueeze(-1) * ffn_output.unsqueeze(-2)
-            + torch.matmul(comb.to(dtype).transpose(-1, -2), residual)
-        )
+        outputs.append(post.to(dtype).unsqueeze(-1) * ffn_output.unsqueeze(-2) + torch.matmul(comb.to(dtype).transpose(-1, -2), residual))
     return outputs, next_topk_indices
 
 
@@ -460,6 +560,8 @@ class Glm5NextMegatronModel(nn.Module):
         self.hc_mult = text_config.hc_mult
         self.hidden_size = text_config.hidden_size
         self.recompute = recompute
+        self.recompute_num_layers = max(1, getattr(mcore_config, "recompute_num_layers", 1))
+        self.moe_dispatch_token_chunk_size = getattr(mcore_config, "glm53_moe_dispatch_token_chunk_size", 512)
 
         self.hf_model = nn.Module()
         self.hf_model.model = nn.Module()
@@ -484,6 +586,17 @@ class Glm5NextMegatronModel(nn.Module):
 
     def set_input_tensor(self, input_tensor):
         self.input_tensor = input_tensor[0] if isinstance(input_tensor, (list, tuple)) else input_tensor
+
+    @property
+    def deferred_output_layer(self):
+        """Return the untied LM head for response-only projection in the loss.
+
+        Applying the 155K-token output head to every prompt token would retain
+        an 8K-by-vocabulary activation on the final PP stage.  The policy loss
+        only consumes response positions, so the Megatron loss closure applies
+        this layer after selecting those positions.
+        """
+        return self.hf_model.lm_head if self.post_process else None
 
     def state_dict_for_save_checkpoint(self, prefix="", keep_vars=False):
         return self.state_dict(prefix=prefix, keep_vars=keep_vars)
@@ -529,48 +642,79 @@ class Glm5NextMegatronModel(nn.Module):
             full = full.view(1, -1, self.hc_mult, self.hidden_size)
 
         intervals = packed_intervals(packed_seq_params.cu_seqlens_q, full.shape[1])
-        sequence_outputs = [full[:, start:end] for start, end in intervals]
-        topk_indices = [None] * len(sequence_outputs)
-        for layer in language_model.layers.values():
-            if isinstance(layer.mlp, Glm5NextMegatronMoE):
-                # Keep one MoE collective per layer on every EP rank.  The
-                # sparse layer is intentionally not activation-checkpointed:
-                # replaying expert collectives during backward is unsafe.
-                sequence_outputs, topk_indices = forward_packed_moe_layer(
-                    layer, sequence_outputs, topk_indices
-                )
-                continue
+        expert_parallel_group = mpu.get_expert_model_parallel_group()
+        recompute_layers = self.recompute and self.training
 
-            next_outputs = []
-            next_topk_indices = []
-            for hidden, previous in zip(sequence_outputs, topk_indices, strict=True):
-                length = hidden.shape[1]
-                positions = torch.arange(length, device=hidden.device).unsqueeze(0)
-                valid = torch.ones(1, length, device=hidden.device, dtype=torch.bool)
+        def run_layer_group(group_input, group_layers):
+            sequence_outputs = [group_input[:, start:end] for start, end in intervals]
+            topk_indices = [None] * len(sequence_outputs)
+            # A one-layer outer checkpoint already drops the complete layer
+            # graph. Nesting non-reentrant attention/MoE checkpoints inside
+            # its replay runs the memory-heavy AscendC KDA forward twice and
+            # raises the backward peak. Inner checkpoints are useful only when
+            # an outer group contains multiple layers.
+            inner_recompute = recompute_layers and len(group_layers) > 1
+            for layer in group_layers:
+                if isinstance(layer.mlp, Glm5NextMegatronMoE):
+                    sequence_outputs, topk_indices = forward_packed_moe_layer(
+                        layer,
+                        sequence_outputs,
+                        topk_indices,
+                        # The outer reentrant group checkpoint runs its first
+                        # forward under no_grad, so these inner checkpoints are
+                        # only materialized while the group is replayed for
+                        # backward.  Checkpointing attention and each routed
+                        # token chunk during that replay prevents a group of
+                        # MoE layers from retaining all dispatcher activations
+                        # at once on the final PP stage.
+                        recompute=inner_recompute,
+                        moe_dispatch_token_chunk_size=self.moe_dispatch_token_chunk_size,
+                        expert_parallel_group=expert_parallel_group,
+                    )
+                    continue
 
-                def layer_forward(x, block=layer, previous=previous, mask=valid, pos=positions):
-                    return block(
-                        x,
-                        attention_mask=mask,
-                        position_ids=pos,
+                next_outputs = []
+                next_topk_indices = []
+                for hidden, previous in zip(sequence_outputs, topk_indices, strict=True):
+                    length = hidden.shape[1]
+                    positions = torch.arange(length, device=hidden.device).unsqueeze(0)
+                    valid = torch.ones(1, length, device=hidden.device, dtype=torch.bool)
+                    hidden, current_topk = layer(
+                        hidden,
+                        attention_mask=valid,
+                        position_ids=positions,
                         use_cache=False,
                         prev_topk_indices=previous,
                     )
+                    next_outputs.append(hidden)
+                    next_topk_indices.append(current_topk)
+                sequence_outputs = next_outputs
+                topk_indices = next_topk_indices
+            return torch.cat(sequence_outputs, dim=1)
 
-                if self.recompute and self.training:
-                    hidden, current_topk = checkpoint(layer_forward, hidden, use_reentrant=False)
-                else:
-                    hidden, current_topk = layer_forward(hidden)
-                next_outputs.append(hidden)
-                next_topk_indices.append(current_topk)
-            sequence_outputs = next_outputs
-            topk_indices = next_topk_indices
-        full = torch.cat(sequence_outputs, dim=1)
+        local_layers = list(language_model.layers.values())
+        for group_start in range(0, len(local_layers), self.recompute_num_layers):
+            group_layers = tuple(local_layers[group_start : group_start + self.recompute_num_layers])
+            if recompute_layers and full.requires_grad:
+                # One-layer checkpoints retain too many 4x-HC boundaries at
+                # 8K, while checkpointing the complete PP stage makes backward
+                # replay all local activations together.  Small layer groups
+                # bound both sides of that memory tradeoff.  Reentrant replay
+                # also guarantees identical EP collective ordering.
+                def group_forward(x, layers=group_layers):
+                    return run_layer_group(x, layers)
+
+                full = checkpoint(group_forward, full, use_reentrant=True)
+            else:
+                full = run_layer_group(full, group_layers)
         local = full[:, cp_rank * local_length : (cp_rank + 1) * local_length]
         if not self.post_process:
             return make_pipeline_payload(local, self.hc_mult, self.hidden_size)
         collapsed = language_model.norm(local.mean(dim=2))
-        return self.hf_model.lm_head(collapsed).float()
+        # The loss closure projects response positions in small chunks.  Do
+        # not materialize full-sequence logits here: prompt positions never
+        # contribute to PPO and dominate final-stage HBM at an 8K sequence.
+        return collapsed
 
 
 def model_provider(pre_process=True, post_process=True, vp_stage=None):
@@ -584,13 +728,25 @@ def model_provider(pre_process=True, post_process=True, vp_stage=None):
     from transformers import AutoConfig
 
     args = get_args()
-    install_stable_eager_kda()
     hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True, local_files_only=True)
     validate_parallelism(args, hf_config)
     text_config = hf_config.text_config
-    text_config._attn_implementation = "eager"
+    from .kernels import install_glm53_kernels
+
+    install_glm53_kernels(
+        kda_backend=args.glm53_kda_backend,
+        causal_conv1d_backend=args.glm53_causal_conv1d_backend,
+        num_heads=text_config.linear_num_heads,
+        safe_gate_lower_bound=text_config.linear_lower_bound,
+        eager_kda_kernel=stable_chunk_kimi_delta_attention,
+    )
+    configure_npu_attention(text_config)
     mcore_config = core_transformer_config_from_args(args)
     mcore_config.glm53_swiglu_limit = text_config.swiglu_limit
+    mcore_config.glm53_moe_dispatch_token_chunk_size = args.glm53_moe_dispatch_token_chunk_size
+    # forward_packed_moe_layer checkpoints the complete routed chunk. Avoid
+    # nested expert/shared-MLP checkpoints during its backward replay.
+    mcore_config.glm53_outer_moe_recompute = getattr(args, "recompute_granularity", None) == "full"
     mcore_config.moe_shared_expert_intermediate_size = None
     stage_config = copy.deepcopy(mcore_config)
     stage_config.hidden_size = text_config.hc_mult * text_config.hidden_size

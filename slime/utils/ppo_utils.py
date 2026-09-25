@@ -196,6 +196,7 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
         with_entropy_grad: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with_entropy_grad = with_entropy and with_entropy_grad
+        ctx.input_dtype = vocab_parallel_logits.dtype
         vocab_parallel_logits = vocab_parallel_logits.float()
         seq_len, vocab_parallel_size = vocab_parallel_logits.shape
         rank, _world_size = _get_vocab_parallel_rank_size(process_group)
@@ -333,7 +334,7 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
         if grad_entropy_input is not None:
             grad_input.add_(grad_entropy_input)
 
-        return grad_input, None, None, None, None, None
+        return grad_input.to(ctx.input_dtype), None, None, None, None, None
 
 
 def _calculate_log_probs_and_entropy_chunk(

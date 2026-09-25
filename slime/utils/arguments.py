@@ -246,6 +246,38 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--glm53-kda-backend",
+                type=str,
+                choices=["ascendc", "triton", "eager"],
+                default="ascendc",
+                help="GLM-5.3 actor KDA implementation (default: ascendc).",
+            )
+            parser.add_argument(
+                "--glm53-causal-conv1d-backend",
+                type=str,
+                choices=["ascendc", "triton", "eager"],
+                default="ascendc",
+                help="GLM-5.3 actor causal-conv1d implementation (default: ascendc).",
+            )
+            parser.add_argument(
+                "--glm53-moe-dispatch-token-chunk-size",
+                type=int,
+                default=512,
+                help=(
+                    "Maximum packed-token count per GLM-5.3 MoE dispatch. "
+                    "Chunking bounds the top-k permutation/all-to-all activation memory at long context."
+                ),
+            )
+            parser.add_argument(
+                "--glm53-lm-head-vocab-chunk-size",
+                type=int,
+                default=1024,
+                help=(
+                    "Vocabulary rows per GLM-5.3 selective LM-head backward chunk. "
+                    "This bounds the untied 155K-vocabulary output-gradient workspace."
+                ),
+            )
+            parser.add_argument(
                 "--recompute-loss-function",
                 action="store_true",
                 help="Whether to disable recompute loss function to save memory during training.",

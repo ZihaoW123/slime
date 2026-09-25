@@ -55,7 +55,11 @@ def npu_tms_temporary_allocation_pool(enabled: bool):
     affected and remain available to ``pause()``/``resume()``.
     """
 
-    if not enabled or not _env_flag("TMS_INIT_ENABLE"):
+    if (
+        not enabled
+        or not _env_flag("TMS_INIT_ENABLE")
+        or not _env_flag("SLIME_NPU_TMS_TEMPORARY_POOL", default=True)
+    ):
         yield
         return
 

@@ -33,7 +33,12 @@ from slime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
-from .loss import ROLLOUT_TOP_P_TOKEN_KEYS, get_rollout_top_p_logprob_kwargs, loss_function
+from .loss import (
+    ROLLOUT_TOP_P_TOKEN_KEYS,
+    get_deferred_log_probs_and_entropy,
+    get_rollout_top_p_logprob_kwargs,
+    loss_function,
+)
 from .model_provider import get_model_provider_func
 from .stateless_adam import StatelessAdam
 from .tms_utils import npu_tms_temporary_allocation_pool
@@ -446,6 +451,16 @@ def forward_only(
         if use_rollout_top_p_replay:
             output_kwargs.update(get_rollout_top_p_logprob_kwargs(args, batch))
 
+        unwrapped_model = model
+        while hasattr(unwrapped_model, "module"):
+            unwrapped_model = unwrapped_model.module
+        deferred_output_layer = getattr(unwrapped_model, "deferred_output_layer", None)
+        if deferred_output_layer is not None:
+            return output_tensor, partial(
+                get_deferred_log_probs_and_entropy,
+                output_layer=deferred_output_layer,
+                **output_kwargs,
+            )
         return output_tensor, partial(f, **output_kwargs)
 
     # Turn on evaluation mode which disables dropout.
@@ -642,7 +657,19 @@ def train_one_step(
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
-        return output_tensor, partial(loss_function, args, batch, num_microbatches, step_global_batch_size)
+        unwrapped_model = model
+        while hasattr(unwrapped_model, "module"):
+            unwrapped_model = unwrapped_model.module
+        deferred_output_layer = getattr(unwrapped_model, "deferred_output_layer", None)
+
+        return output_tensor, partial(
+            loss_function,
+            args,
+            batch,
+            num_microbatches,
+            step_global_batch_size,
+            deferred_output_layer=deferred_output_layer,
+        )
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
@@ -665,7 +692,6 @@ def train_one_step(
             decoder_seq_length=args.decoder_seq_length,
             forward_only=False,
         )
-
     with npu_tms_temporary_allocation_pool(args.offload_train):
         valid_step = True
         grad_norm = float("nan")
@@ -695,7 +721,6 @@ def train_one_step(
             # batching is on so the scheduler's samples-seen counter tracks reality.
             assert update_successful
             opt_param_scheduler.step(increment=step_global_batch_size)
-
     # release grad
     for model_chunk in model:
         model_chunk.zero_grad_buffer()
